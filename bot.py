@@ -1,0 +1,1601 @@
+import asyncio
+import contextlib
+import io
+import mimetypes
+import os
+import posixpath
+import re
+import uuid
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set, Tuple
+
+import aiohttp
+import discord
+from defusedxml import ElementTree as SafeET
+from discord.ext import commands
+from dotenv import load_dotenv
+from xml.etree import ElementTree as ET
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+SESSION_TIMEOUT_SECONDS = 15 * 60
+MAX_SESSION_LIFETIME_SECONDS = 60 * 60
+INITIAL_LOAD_ATTACHMENTS = 100
+PAGE_SIZE = 25
+
+MAX_SOURCE_EPUB_BYTES = 50 * 1024 * 1024
+MAX_SOURCE_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+MAX_SINGLE_FILE_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
+MAX_OUTPUT_EPUB_BYTES = 25 * 1024 * 1024
+HTTP_TIMEOUT_SECONDS = 300
+
+ALLOWED_NAME_RE = re.compile(r"^[A-Za-z0-9 _.,'()\-]+$")
+SAFE_FILE_RE = re.compile(r"[^A-Za-z0-9._\-]")
+SAFE_META_RE = re.compile(r"\s+")
+EPUB_EXT_RE = re.compile(r"\.epub$", re.IGNORECASE)
+
+CONTAINER_NS = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+ET.register_namespace("", XHTML_NS)
+ET.register_namespace("svg", SVG_NS)
+ET.register_namespace("xlink", XLINK_NS)
+
+intents = discord.Intents.default()
+intents.message_content = False
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+SESSIONS: Dict[Tuple[int, int], "CompileSession"] = {}
+
+GUIDE_SKIP_TYPES = {
+    "cover",
+    "title-page",
+    "toc",
+}
+
+TEXT_TAGS = {
+    "p",
+    "div",
+    "span",
+    "blockquote",
+    "li",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+}
+
+IMAGE_TAGS = {"img", "image"}
+
+
+def log(msg: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def sanitize_output_name(raw: str) -> str:
+    raw = raw.strip().strip(".")
+    if not raw:
+        return "compiled"
+    if not ALLOWED_NAME_RE.fullmatch(raw):
+        raise ValueError(
+            "Only letters, numbers, spaces, dash, underscore, comma, "
+            "period, apostrophe, and parentheses are allowed."
+        )
+    return raw[:120] or "compiled"
+
+
+def sanitize_author(raw: str) -> str:
+    raw = SAFE_META_RE.sub(" ", raw or "").strip()
+    raw = "".join(ch for ch in raw if ch.isprintable())
+    return raw[:120] or "Discord Channel"
+
+
+def sanitize_internal_name(name: str, default_stem: str) -> str:
+    base = posixpath.basename(name.replace("\\", "/")).strip()
+    if not base:
+        base = default_stem
+    if "." in base:
+        stem, ext = base.rsplit(".", 1)
+        ext = "." + SAFE_FILE_RE.sub("", ext.lower())
+    else:
+        stem, ext = base, ""
+    stem = SAFE_FILE_RE.sub("_", stem).strip("._")
+    if not stem:
+        stem = default_stem
+    return stem + ext
+
+
+def safe_output_zip_path(prefix: str, filename: str) -> str:
+    clean = sanitize_internal_name(filename, "file")
+
+    if "/" in clean or "\\" in clean:
+        raise ValueError(f"Unsafe output filename: {filename}")
+
+    return f"{prefix.rstrip('/')}/{clean}"
+
+
+def make_unique_name(name: str, used: Set[str]) -> str:
+    if name not in used:
+        used.add(name)
+        return name
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem, ext = name, ""
+    i = 2
+    while True:
+        candidate = f"{stem}_{i}{ext}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        i += 1
+
+
+def resolve_href(base_path: str, href: str) -> str:
+    clean = href.split("#", 1)[0].strip()
+
+    if not clean:
+        raise ValueError("Empty href")
+
+    if "\x00" in clean:
+        raise ValueError("Invalid href")
+
+    clean = clean.replace("\\", "/")
+
+    resolved = posixpath.normpath(
+        posixpath.join(posixpath.dirname(base_path), clean)
+    )
+
+    if resolved.startswith("/") or resolved == ".." or resolved.startswith("../"):
+        raise ValueError(f"Unsafe href: {href}")
+
+    if any(part == ".." for part in resolved.split("/")):
+        raise ValueError(f"Unsafe href: {href}")
+
+    return resolved
+
+
+def is_epub_attachment(att: discord.Attachment) -> bool:
+    return bool(att.filename and EPUB_EXT_RE.search(att.filename))
+
+
+def has_manifest_property(props: str, prop: str) -> bool:
+    return prop in {p.strip().lower() for p in (props or "").split()}
+
+
+def looks_like_structural_page_by_name(href: str, manifest_props: str) -> bool:
+    name = posixpath.basename(href.lower())
+
+    if has_manifest_property(manifest_props, "nav"):
+        return True
+
+    structural_names = {
+        "nav.xhtml",
+        "nav.html",
+        "toc.xhtml",
+        "toc.html",
+        "toc.ncx",
+        "cover.xhtml",
+        "cover.html",
+        "titlepage.xhtml",
+        "titlepage.html",
+        "title-page.xhtml",
+        "title-page.html",
+    }
+    return name in structural_names
+
+
+def format_bytes(size: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{size} B"
+
+
+def get_text_content(elem: Optional[ET.Element]) -> str:
+    if elem is None:
+        return ""
+    return " ".join("".join(elem.itertext()).split()).strip()
+
+
+@dataclass
+class EpubEntry:
+    entry_id: str
+    channel_id: int
+    message_id: int
+    attachment_index: int
+    filename: str
+    url: str
+    proxy_url: str
+    size: int
+    created_at: datetime
+
+
+@dataclass
+class CompileSession:
+    user_id: int
+    channel_id: int
+    channel_name: str
+    entries: List[EpubEntry] = field(default_factory=list)
+    selected_ids: Set[str] = field(default_factory=set)
+    seen_attachments: Set[Tuple[int, int]] = field(default_factory=set)
+    current_page: int = 0
+    scan_before_message_id: Optional[int] = None
+    scan_complete: bool = False
+    scan_in_progress: bool = False
+    created_at: datetime = field(default_factory=now_utc)
+    last_accessed_at: datetime = field(default_factory=now_utc)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def touch(self) -> None:
+        self.last_accessed_at = now_utc()
+
+    @property
+    def page_count(self) -> int:
+        if not self.entries:
+            return 1
+        return (len(self.entries) + PAGE_SIZE - 1) // PAGE_SIZE
+
+    def get_page_entries(self, page: int) -> List[EpubEntry]:
+        start = page * PAGE_SIZE
+        end = start + PAGE_SIZE
+        return self.entries[start:end]
+
+    def current_page_entries(self) -> List[EpubEntry]:
+        return self.get_page_entries(self.current_page)
+
+    def sort_selected_for_compile(self) -> List[EpubEntry]:
+        selected = [e for e in self.entries if e.entry_id in self.selected_ids]
+        selected.sort(key=lambda e: (e.created_at, e.message_id, e.attachment_index))
+        return selected
+
+    def all_selected_on_page(self) -> bool:
+        page_entries = self.current_page_entries()
+        return bool(page_entries) and all(
+            entry.entry_id in self.selected_ids for entry in page_entries
+        )
+
+
+class EpubSelect(discord.ui.Select):
+    def __init__(self, session: CompileSession):
+        page_entries = session.current_page_entries()
+        options = []
+        selected_on_page = {
+            entry.entry_id
+            for entry in page_entries
+            if entry.entry_id in session.selected_ids
+        }
+
+        for entry in page_entries:
+            created = entry.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            label = entry.filename[:100]
+            description = f"{created} • msg {entry.message_id}"
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=entry.entry_id,
+                    description=description[:100],
+                    default=entry.entry_id in selected_on_page,
+                )
+            )
+
+        max_values = max(1, len(options))
+        super().__init__(
+            placeholder="Select EPUBs on this page",
+            min_values=0,
+            max_values=max_values,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view: CompileView = self.view  # type: ignore
+        session = view.session
+
+        if interaction.user.id != session.user_id:
+            await interaction.response.send_message(
+                "This picker isn't yours.", ephemeral=True
+            )
+            return
+
+        async with session.lock:
+            session.touch()
+            page_entries = session.current_page_entries()
+            page_ids = {e.entry_id for e in page_entries}
+
+            session.selected_ids.difference_update(page_ids)
+            session.selected_ids.update(self.values)
+
+            new_view = CompileView(session)
+            new_view.message = view.message
+
+        await interaction.response.edit_message(
+            content=new_view.render_content(),
+            view=new_view,
+        )
+
+
+class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
+    output_name = discord.ui.TextInput(
+        label="Output name",
+        placeholder="Example: My Compiled Book",
+        min_length=1,
+        max_length=120,
+        required=True,
+    )
+
+    def __init__(self, session: CompileSession):
+        super().__init__(timeout=300)
+        self.session = session
+        self.output_name.default = sanitize_output_name(session.channel_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message(
+                "This modal isn't yours.", ephemeral=True
+            )
+            return
+
+        try:
+            output_name = sanitize_output_name(str(self.output_name))
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        async with self.session.lock:
+            self.session.touch()
+            selected = self.session.sort_selected_for_compile()
+
+        if not selected:
+            await interaction.response.send_message(
+                "You haven't selected any EPUBs.", ephemeral=True
+            )
+            return
+
+        log(
+            f"Compiling {len(selected)} EPUB(s) "
+            f"for {interaction.user} in #{self.session.channel_name}"
+        )
+
+        await interaction.response.send_message(
+            f"Compiling {len(selected)} EPUB(s). I'll DM you the result.",
+            ephemeral=True,
+        )
+
+        try:
+            output_bytes, skipped = await compile_selected_epubs(
+                selected=selected,
+                title=output_name,
+                author=sanitize_author(self.session.channel_name),
+            )
+        except Exception as exc:
+            log(f"Compile failed for {interaction.user}: {exc}")
+            await interaction.followup.send(
+                f"Compile failed: {exc}", ephemeral=True
+            )
+            return
+
+        if output_bytes is None:
+            log(f"All selected EPUBs failed for {interaction.user}")
+            detail = "\n".join(f"- {name}: {reason}" for name, reason in skipped)
+            msg = "All selected EPUBs failed."
+            if detail:
+                msg += f"\n{detail}"
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            return
+
+        if len(output_bytes) > MAX_OUTPUT_EPUB_BYTES:
+            await interaction.followup.send(
+                (
+                    "The compiled EPUB is too large to send through Discord.\n"
+                    f"Compiled size: {format_bytes(len(output_bytes))}\n"
+                    f"Limit: {format_bytes(MAX_OUTPUT_EPUB_BYTES)}\n"
+                    "Try selecting fewer EPUBs and compile again."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        dm_text = [f"Here is your compiled EPUB: {output_name}.epub"]
+        if skipped:
+            dm_text.append("")
+            dm_text.append("Skipped source EPUBs:")
+            dm_text.extend(f"- {name}: {reason}" for name, reason in skipped)
+
+        try:
+            await interaction.user.send(
+                "\n".join(dm_text)[:1900],
+                file=discord.File(
+                    io.BytesIO(output_bytes), filename=f"{output_name}.epub"
+                ),
+            )
+        except discord.Forbidden:
+            log(f"Couldn't DM compiled EPUB to {interaction.user}")
+            await interaction.followup.send(
+                "I couldn't DM you. Please enable DMs from this server and try again.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as exc:
+            log(f"Couldn't send compiled EPUB to {interaction.user}: {exc}")
+            await interaction.followup.send(
+                (
+                    "I couldn't send the EPUB through Discord. "
+                    "It may be too large or Discord rejected the upload.\n"
+                    f"Compiled size: {format_bytes(len(output_bytes))}\n"
+                    f"Configured limit: {format_bytes(MAX_OUTPUT_EPUB_BYTES)}\n"
+                    "Try selecting fewer EPUBs and compile again."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        log(f"{len(selected)} EPUB(s) compiled and sent to {interaction.user}")
+        await interaction.followup.send("Done. Check your DMs.", ephemeral=True)
+
+
+class CompileView(discord.ui.View):
+    def __init__(self, session: CompileSession):
+        super().__init__(timeout=SESSION_TIMEOUT_SECONDS)
+        self.session = session
+        self.message: Optional[discord.Message] = None
+
+        if session.current_page_entries():
+            self.add_item(EpubSelect(session))
+
+        self.prev_button.disabled = session.current_page <= 0
+        can_advance_loaded = session.current_page < session.page_count - 1
+        self.next_button.disabled = not (can_advance_loaded or not session.scan_complete)
+
+        all_selected = session.all_selected_on_page()
+        self.select_all_button.label = (
+            "Deselect all" if all_selected else "Select all"
+        )
+        self.select_all_button.disabled = not bool(session.current_page_entries())
+
+    def render_content(self) -> str:
+        session = self.session
+        total = len(session.entries)
+        selected = len(session.selected_ids)
+        page = session.current_page + 1
+        pages = session.page_count
+        status = "complete" if session.scan_complete else "partial"
+        return (
+            f"EPUB picker\n"
+            f"Found: {total} EPUB attachment(s) ({status})\n"
+            f"Selected: {selected}\n"
+            f"Page: {page}/{pages}\n"
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message(
+                "This picker isn't yours.", ephemeral=True
+            )
+            return False
+        self.session.touch()
+        return True
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with self.session.lock:
+            if self.session.current_page > 0:
+                self.session.current_page -= 1
+
+            new_view = CompileView(self.session)
+            new_view.message = self.message
+
+        await interaction.response.edit_message(
+            content=new_view.render_content(),
+            view=new_view,
+        )
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        channel = interaction.channel
+        if channel is None:
+            await interaction.response.send_message(
+                "Channel is unavailable.", ephemeral=True
+            )
+            return
+
+        async with self.session.lock:
+            if self.session.current_page < self.session.page_count - 1:
+                self.session.current_page += 1
+                new_view = CompileView(self.session)
+                new_view.message = self.message
+                await interaction.response.edit_message(
+                    content=new_view.render_content(),
+                    view=new_view,
+                )
+                return
+
+            if self.session.scan_complete:
+                await interaction.response.defer()
+                return
+
+        await interaction.response.defer()
+
+        ok, error = await load_more_entries(channel, self.session)
+        if not ok:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
+        async with self.session.lock:
+            if self.session.current_page < self.session.page_count - 1:
+                self.session.current_page += 1
+
+            new_view = CompileView(self.session)
+            new_view.message = self.message
+
+        try:
+            if self.message is not None:
+                await self.message.edit(
+                    content=new_view.render_content(),
+                    view=new_view,
+                )
+            else:
+                await interaction.edit_original_response(
+                    content=new_view.render_content(),
+                    view=new_view,
+                )
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"Couldn't update picker: {exc}", ephemeral=True
+            )
+
+    @discord.ui.button(
+        label="Select all", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def select_all_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with self.session.lock:
+            page_entries = self.session.current_page_entries()
+            page_ids = {e.entry_id for e in page_entries}
+
+            if all(
+                entry.entry_id in self.session.selected_ids
+                for entry in page_entries
+            ):
+                self.session.selected_ids.difference_update(page_ids)
+            else:
+                self.session.selected_ids.update(page_ids)
+
+            new_view = CompileView(self.session)
+            new_view.message = self.message
+
+        await interaction.response.edit_message(
+            content=new_view.render_content(),
+            view=new_view,
+        )
+
+    @discord.ui.button(label="Compile", style=discord.ButtonStyle.primary, row=1)
+    async def compile_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        async with self.session.lock:
+            has_selection = bool(self.session.selected_ids)
+
+        if not has_selection:
+            await interaction.response.send_message(
+                "Select at least one EPUB first.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(CompileNameModal(self.session))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is not None:
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await self.message.edit(
+                    content="This picker expired. Run `/compile` again.",
+                    view=self,
+                )
+
+
+async def cleanup_sessions() -> None:
+    while True:
+        await asyncio.sleep(300)
+
+        now_ts = now_utc().timestamp()
+        idle_cutoff = now_ts - SESSION_TIMEOUT_SECONDS
+        lifetime_cutoff = now_ts - MAX_SESSION_LIFETIME_SECONDS
+
+        stale = [
+            key
+            for key, session in SESSIONS.items()
+            if (
+                session.last_accessed_at.timestamp() < idle_cutoff
+                or session.created_at.timestamp() < lifetime_cutoff
+            )
+        ]
+        for key in stale:
+            SESSIONS.pop(key, None)
+
+
+async def scan_for_epubs(
+    channel: discord.abc.Messageable,
+    session: CompileSession,
+    target_new_count: int,
+) -> Tuple[bool, Optional[str]]:
+    async with session.lock:
+        if session.scan_in_progress or session.scan_complete:
+            return True, None
+        session.scan_in_progress = True
+
+    try:
+        start_count = len(session.entries)
+
+        while len(session.entries) - start_count < target_new_count:
+            history_kwargs = {"limit": 100}
+            if session.scan_before_message_id:
+                history_kwargs["before"] = discord.Object(
+                    id=session.scan_before_message_id
+                )
+
+            try:
+                batch = [m async for m in channel.history(**history_kwargs)]
+            except discord.Forbidden:
+                log(f"Couldn't read message history in #{session.channel_name}")
+                return False, "I can't read message history in this channel."
+            except discord.HTTPException as exc:
+                log(f"Failed to read message history in #{session.channel_name}: {exc}")
+                return False, f"Failed to read channel history: {exc}"
+
+            if not batch:
+                async with session.lock:
+                    session.scan_complete = True
+                break
+
+            async with session.lock:
+                for msg in batch:
+                    for idx, att in enumerate(msg.attachments):
+                        if not is_epub_attachment(att):
+                            continue
+
+                        dedupe_key = (msg.id, idx)
+                        if dedupe_key in session.seen_attachments:
+                            continue
+
+                        session.seen_attachments.add(dedupe_key)
+                        session.entries.append(
+                            EpubEntry(
+                                entry_id=str(uuid.uuid4()),
+                                channel_id=msg.channel.id,
+                                message_id=msg.id,
+                                attachment_index=idx,
+                                filename=att.filename,
+                                url=att.url,
+                                proxy_url=att.proxy_url,
+                                size=att.size,
+                                created_at=msg.created_at,
+                            )
+                        )
+
+                session.scan_before_message_id = batch[-1].id
+
+                if len(batch) < 100:
+                    session.scan_complete = True
+                    break
+
+        return True, None
+    finally:
+        async with session.lock:
+            session.scan_in_progress = False
+            session.touch()
+
+
+async def load_more_entries(
+    channel: discord.abc.Messageable, session: CompileSession
+) -> Tuple[bool, Optional[str]]:
+    return await scan_for_epubs(
+        channel=channel,
+        session=session,
+        target_new_count=INITIAL_LOAD_ATTACHMENTS,
+    )
+
+
+def build_session_key(user_id: int, channel_id: int) -> Tuple[int, int]:
+    return user_id, channel_id
+
+
+async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> bytes:
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+
+        content_length = resp.headers.get("Content-Length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_SOURCE_EPUB_BYTES:
+                    raise ValueError("Attachment is too large")
+            except ValueError:
+                raise ValueError("Attachment is too large")
+
+        data = bytearray()
+
+        async for chunk in resp.content.iter_chunked(256 * 1024):
+            data.extend(chunk)
+
+            if len(data) > MAX_SOURCE_EPUB_BYTES:
+                raise ValueError("Attachment is too large")
+
+        return bytes(data)
+
+
+async def fetch_epub_bytes(http: aiohttp.ClientSession, entry: EpubEntry) -> bytes:
+    last_error: Optional[Exception] = None
+
+    for candidate in [entry.url, entry.proxy_url]:
+        if not candidate:
+            continue
+        try:
+            return await fetch_bytes(http, candidate)
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("No valid attachment URL available")
+
+
+def parse_xml(data: bytes) -> ET.Element:
+    return SafeET.fromstring(data)
+
+
+def safe_zip_read(zf: zipfile.ZipFile, name: str) -> bytes:
+    info = zf.getinfo(name)
+    if info.file_size > MAX_SINGLE_FILE_UNCOMPRESSED_BYTES:
+        raise ValueError(f"File too large inside EPUB: {name}")
+    return zf.read(name)
+
+
+def validate_zip_member_names(zf: zipfile.ZipFile) -> None:
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+
+        if "\x00" in name:
+            raise ValueError(f"Invalid EPUB path: {info.filename}")
+
+        if name.startswith("/"):
+            raise ValueError(f"Unsafe absolute EPUB path: {info.filename}")
+
+        parts = name.split("/")
+        if any(part == ".." for part in parts):
+            raise ValueError(f"Unsafe EPUB path traversal: {info.filename}")
+
+
+def validate_zip_sizes(zf: zipfile.ZipFile) -> None:
+    total = 0
+    for info in zf.infolist():
+        if info.file_size > MAX_SINGLE_FILE_UNCOMPRESSED_BYTES:
+            raise ValueError(f"EPUB member too large: {info.filename}")
+        total += info.file_size
+        if total > MAX_SOURCE_UNCOMPRESSED_BYTES:
+            raise ValueError("EPUB uncompressed content is too large")
+
+
+def find_container_rootfile(zf: zipfile.ZipFile) -> str:
+    data = safe_zip_read(zf, "META-INF/container.xml")
+    root = parse_xml(data)
+    rootfile = root.find(".//c:rootfile", CONTAINER_NS)
+    if rootfile is None:
+        raise ValueError("Missing rootfile in container.xml")
+    path = rootfile.get("full-path")
+    if not path:
+        raise ValueError("container.xml rootfile missing full-path")
+    return path
+
+
+def parse_opf(
+    zf: zipfile.ZipFile, opf_path: str
+) -> Tuple[str, Dict[str, dict], List[str], Set[str]]:
+    data = safe_zip_read(zf, opf_path)
+    root = parse_xml(data)
+    opf_dir = posixpath.dirname(opf_path)
+
+    manifest = {}
+    spine = []
+    structural_hrefs_to_skip: Set[str] = set()
+
+    manifest_elem = None
+    spine_elem = None
+    guide_elem = None
+
+    for child in root:
+        lname = local_name(child.tag)
+        if lname == "manifest":
+            manifest_elem = child
+        elif lname == "spine":
+            spine_elem = child
+        elif lname == "guide":
+            guide_elem = child
+
+    if manifest_elem is None or spine_elem is None:
+        raise ValueError("OPF missing manifest or spine")
+
+    for item in manifest_elem:
+        if local_name(item.tag) != "item":
+            continue
+        item_id = item.get("id")
+        href = item.get("href")
+        media_type = item.get("media-type", "")
+        props = item.get("properties", "")
+        if not item_id or not href:
+            continue
+        full_path = posixpath.normpath(posixpath.join(opf_dir, href))
+        manifest[item_id] = {
+            "href": full_path,
+            "media_type": media_type,
+            "properties": props,
+        }
+
+    for itemref in spine_elem:
+        if local_name(itemref.tag) != "itemref":
+            continue
+        idref = itemref.get("idref")
+        if idref:
+            spine.append(idref)
+
+    if guide_elem is not None:
+        for ref in guide_elem:
+            if local_name(ref.tag) != "reference":
+                continue
+
+            ref_type = (ref.get("type") or "").strip().lower()
+            href = ref.get("href")
+
+            if ref_type not in GUIDE_SKIP_TYPES or not href:
+                continue
+
+            full_path = posixpath.normpath(
+                posixpath.join(opf_dir, href.split("#", 1)[0])
+            )
+
+            if not (
+                full_path.startswith("../")
+                or full_path == ".."
+                or full_path.startswith("/")
+            ):
+                structural_hrefs_to_skip.add(full_path)
+
+    return opf_dir, manifest, spine, structural_hrefs_to_skip
+
+
+def find_first_by_local_name(root: ET.Element, name: str) -> Optional[ET.Element]:
+    for elem in root.iter():
+        if local_name(elem.tag) == name:
+            return elem
+    return None
+
+
+def get_document_namespace(root: ET.Element) -> str:
+    if root.tag.startswith("{") and "}" in root.tag:
+        return root.tag[1:].split("}", 1)[0]
+    return XHTML_NS
+
+
+def find_head(root: ET.Element) -> Optional[ET.Element]:
+    for elem in root.iter():
+        if local_name(elem.tag) == "head":
+            return elem
+    return None
+
+
+def extract_title_from_xhtml(root: ET.Element) -> str:
+    for name in ("h1", "h2", "title"):
+        elem = find_first_by_local_name(root, name)
+        text = get_text_content(elem)
+        if text:
+            return text[:120]
+
+    return ""
+
+
+def remove_stylesheet_links_and_add_main(root: ET.Element) -> None:
+    ns = get_document_namespace(root)
+    head = find_head(root)
+
+    if head is None:
+        head = ET.Element(f"{{{ns}}}head")
+        root.insert(0, head)
+
+    to_remove = []
+    for child in list(head):
+        if local_name(child.tag) != "link":
+            continue
+        rel = (child.get("rel") or "").lower()
+        if "stylesheet" in rel:
+            to_remove.append(child)
+
+    for child in to_remove:
+        head.remove(child)
+
+    link = ET.Element(f"{{{ns}}}link")
+    link.set("rel", "stylesheet")
+    link.set("type", "text/css")
+    link.set("href", "../styles/main.css")
+    head.append(link)
+
+
+def gather_and_rewrite_images(
+    root: ET.Element,
+    chapter_path: str,
+    zf: zipfile.ZipFile,
+    image_name_map: Dict[str, str],
+    used_image_names: Set[str],
+) -> Dict[str, bytes]:
+    collected = {}
+
+    for elem in root.iter():
+        tag = local_name(elem.tag)
+        attrs = []
+
+        if tag == "img":
+            attrs.append("src")
+        elif tag == "image":
+            attrs.extend([f"{{{XLINK_NS}}}href", "href"])
+
+        for attr in attrs:
+            val = elem.get(attr)
+            if not val:
+                continue
+
+            lower_val = val.strip().lower()
+
+            if (
+                lower_val.startswith("data:")
+                or lower_val.startswith("http://")
+                or lower_val.startswith("https://")
+                or lower_val.startswith("//")
+            ):
+                continue
+
+            try:
+                full = resolve_href(chapter_path, val)
+            except ValueError:
+                continue
+
+            if full not in image_name_map:
+                original_name = sanitize_internal_name(
+                    posixpath.basename(full), "image"
+                )
+                unique_name = make_unique_name(original_name, used_image_names)
+                image_name_map[full] = unique_name
+
+            new_name = image_name_map[full]
+            if full not in collected:
+                try:
+                    collected[full] = safe_zip_read(zf, full)
+                except KeyError:
+                    continue
+
+            elem.set(attr, f"../images/{new_name}")
+
+    return collected
+
+
+def strip_dangerous_elements(root: ET.Element) -> None:
+    dangerous = {
+        "script",
+        "iframe",
+        "object",
+        "embed",
+    }
+
+    for parent in root.iter():
+        for child in list(parent):
+            if local_name(child.tag) in dangerous:
+                parent.remove(child)
+
+
+def strip_dangerous_attributes(root: ET.Element) -> None:
+    for elem in root.iter():
+        for attr in list(elem.attrib):
+            attr_lname = local_name(attr).lower()
+            value = (elem.get(attr) or "").strip().lower()
+
+            if attr_lname.startswith("on"):
+                elem.attrib.pop(attr, None)
+                continue
+
+            if attr_lname in {"href", "src"} and value.startswith("javascript:"):
+                elem.attrib.pop(attr, None)
+                continue
+
+
+def get_meaningful_text_length(root: ET.Element) -> int:
+    parts = []
+
+    for elem in root.iter():
+        if local_name(elem.tag) in TEXT_TAGS:
+            text = " ".join("".join(elem.itertext()).split())
+            if text:
+                parts.append(text)
+
+    return len(" ".join(parts))
+
+
+def count_inline_images(root: ET.Element) -> int:
+    count = 0
+
+    for elem in root.iter():
+        if local_name(elem.tag) in IMAGE_TAGS:
+            count += 1
+
+    return count
+
+
+def count_links(root: ET.Element) -> int:
+    count = 0
+
+    for elem in root.iter():
+        if local_name(elem.tag) == "a" and elem.get("href"):
+            count += 1
+
+    return count
+
+
+def is_probably_toc_page(root: ET.Element) -> bool:
+    text_len = get_meaningful_text_length(root)
+    link_count = count_links(root)
+
+    if link_count < 12:
+        return False
+
+    if text_len >= 1500:
+        return False
+
+    link_density = link_count / max(text_len / 500, 1)
+
+    return link_density >= 6
+
+
+def is_probably_non_chapter_page(root: ET.Element, href: str) -> bool:
+    text_len = get_meaningful_text_length(root)
+    image_count = count_inline_images(root)
+    name = posixpath.basename(href.lower())
+
+    if text_len < 50 and image_count == 0:
+        return True
+
+    if image_count > 0 and text_len < 80:
+        return True
+
+    if is_probably_toc_page(root):
+        return True
+
+    weak_structural_name_parts = (
+        "cover",
+        "titlepage",
+        "title-page",
+        "toc",
+        "nav",
+    )
+
+    if any(part in name for part in weak_structural_name_parts) and text_len < 500:
+        return True
+
+    return False
+
+
+def chapter_media_type(media_type: str) -> bool:
+    return media_type in {
+        "application/xhtml+xml",
+        "text/html",
+        "application/xml",
+    }
+
+
+def build_simple_stylesheet() -> bytes:
+    css = """
+body {
+  font-family: serif;
+  line-height: 1.45;
+  margin: 5%;
+}
+h1, h2, h3, h4, h5, h6 {
+  margin-top: 1.4em;
+  margin-bottom: 0.6em;
+}
+p {
+  margin: 0 0 0.9em 0;
+}
+img, svg {
+  max-width: 100%;
+}
+"""
+    return css.strip().encode("utf-8")
+
+
+def make_nav_xhtml(chapters: List[Tuple[str, str]]) -> bytes:
+    epub_ns = "http://www.idpf.org/2007/ops"
+
+    ET.register_namespace("", XHTML_NS)
+    ET.register_namespace("epub", epub_ns)
+
+    html = ET.Element(f"{{{XHTML_NS}}}html")
+    html.set(f"{{{XML_NS}}}lang", "en")
+    html.set("lang", "en")
+
+    head = ET.SubElement(html, f"{{{XHTML_NS}}}head")
+    title = ET.SubElement(head, f"{{{XHTML_NS}}}title")
+    title.text = "Table of Contents"
+
+    body = ET.SubElement(html, f"{{{XHTML_NS}}}body")
+    nav = ET.SubElement(body, f"{{{XHTML_NS}}}nav")
+    nav.set(f"{{{epub_ns}}}type", "toc")
+    nav.set("id", "toc")
+
+    h1 = ET.SubElement(nav, f"{{{XHTML_NS}}}h1")
+    h1.text = "Table of Contents"
+
+    ol = ET.SubElement(nav, f"{{{XHTML_NS}}}ol")
+
+    for href, label in chapters:
+        li = ET.SubElement(ol, f"{{{XHTML_NS}}}li")
+        a = ET.SubElement(li, f"{{{XHTML_NS}}}a")
+        a.set("href", href)
+        a.text = label
+
+    ET.indent(html, space="  ")
+
+    return ET.tostring(
+        html, encoding="utf-8", xml_declaration=True, method="xml"
+    )
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def make_toc_ncx(chapters: List[Tuple[str, str]], uid: str, title_text: str) -> bytes:
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">',
+        "  <head>",
+        f'    <meta name="dtb:uid" content="{_xml_escape(uid)}" />',
+        "  </head>",
+        "  <docTitle>",
+        f"    <text>{_xml_escape(title_text)}</text>",
+        "  </docTitle>",
+        "  <navMap>",
+    ]
+
+    for i, (href, label) in enumerate(chapters, start=1):
+        lines.extend(
+            [
+                f'    <navPoint id="navPoint-{i}" playOrder="{i}">',
+                "      <navLabel>",
+                f"        <text>{_xml_escape(label)}</text>",
+                "      </navLabel>",
+                f'      <content src="{_xml_escape(href)}" />',
+                "    </navPoint>",
+            ]
+        )
+
+    lines.extend(
+        [
+            "  </navMap>",
+            "</ncx>",
+            "",
+        ]
+    )
+
+    return "\n".join(lines).encode("utf-8")
+
+
+def guess_media_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    known = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "svg": "image/svg+xml",
+        "webp": "image/webp",
+    }
+
+    if ext in known:
+        return known[ext]
+
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+def make_content_opf(
+    uid: str,
+    title_text: str,
+    author: str,
+    chapters: List[Tuple[str, str]],
+    image_names: List[str],
+) -> bytes:
+    modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<package xmlns="http://www.idpf.org/2007/opf" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'version="3.0" unique-identifier="bookid">',
+        "  <metadata>",
+        f'    <dc:identifier id="bookid">{_xml_escape(uid)}</dc:identifier>',
+        f"    <dc:title>{_xml_escape(title_text)}</dc:title>",
+        f"    <dc:creator>{_xml_escape(author)}</dc:creator>",
+        "    <dc:language>en</dc:language>",
+        f'    <meta property="dcterms:modified">{modified}</meta>',
+        "  </metadata>",
+        "  <manifest>",
+        '    <item id="nav" href="nav.xhtml" '
+        'media-type="application/xhtml+xml" properties="nav" />',
+        '    <item id="ncx" href="toc.ncx" '
+        'media-type="application/x-dtbncx+xml" />',
+        '    <item id="style" href="styles/main.css" media-type="text/css" />',
+    ]
+
+    for i, (href, _) in enumerate(chapters, start=1):
+        lines.append(
+            f'    <item id="chap{i}" href="{_xml_escape(href)}" '
+            'media-type="application/xhtml+xml" />'
+        )
+
+    for i, image_name in enumerate(image_names, start=1):
+        media_type = guess_media_type(image_name)
+
+        lines.append(
+            f'    <item id="img{i}" href="images/{_xml_escape(image_name)}" '
+            f'media-type="{media_type}" />'
+        )
+
+    lines.append("  </manifest>")
+    lines.append('  <spine toc="ncx">')
+
+    for i in range(1, len(chapters) + 1):
+        lines.append(f'    <itemref idref="chap{i}" />')
+
+    lines.extend(
+        [
+            "  </spine>",
+            "</package>",
+            "",
+        ]
+    )
+
+    return "\n".join(lines).encode("utf-8")
+
+
+def make_container_xml() -> bytes:
+    data = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0"
+  xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf"
+      media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    return data.encode("utf-8")
+
+
+def extract_book_content(
+    epub_bytes: bytes,
+    used_chapter_names: Set[str],
+    used_image_names: Set[str],
+) -> Tuple[List[Tuple[str, str, bytes]], Dict[str, bytes]]:
+    chapters_out: List[Tuple[str, str, bytes]] = []
+    images_out: Dict[str, bytes] = {}
+    image_name_map: Dict[str, str] = {}
+
+    epub_ns = "http://www.idpf.org/2007/ops"
+
+    with zipfile.ZipFile(io.BytesIO(epub_bytes), "r") as zf:
+        validate_zip_member_names(zf)
+        validate_zip_sizes(zf)
+        opf_path = find_container_rootfile(zf)
+        _, manifest, spine, structural_hrefs_to_skip = parse_opf(zf, opf_path)
+
+        chapter_index = 1
+        for idref in spine:
+            item = manifest.get(idref)
+            if not item:
+                continue
+
+            href = item["href"]
+            media_type = item["media_type"]
+            props = item["properties"]
+
+            if not chapter_media_type(media_type):
+                continue
+            if has_manifest_property(props, "nav"):
+                continue
+            if has_manifest_property(props, "cover-image"):
+                continue
+            if href in structural_hrefs_to_skip:
+                continue
+            if looks_like_structural_page_by_name(href, props):
+                continue
+
+            try:
+                raw = safe_zip_read(zf, href)
+            except KeyError:
+                continue
+
+            try:
+                root = parse_xml(raw)
+            except ET.ParseError:
+                continue
+
+            if local_name(root.tag) != "html":
+                continue
+
+            strip_dangerous_elements(root)
+            strip_dangerous_attributes(root)
+
+            if is_probably_non_chapter_page(root, href):
+                continue
+
+            remove_stylesheet_links_and_add_main(root)
+            found_images = gather_and_rewrite_images(
+                root=root,
+                chapter_path=href,
+                zf=zf,
+                image_name_map=image_name_map,
+                used_image_names=used_image_names,
+            )
+
+            for original_path, image_bytes in found_images.items():
+                new_name = image_name_map[original_path]
+                images_out[new_name] = image_bytes
+
+            chapter_title = extract_title_from_xhtml(root)
+            if not chapter_title:
+                chapter_title = f"Chapter {len(chapters_out) + 1}"
+
+            original_name = sanitize_internal_name(
+                posixpath.basename(href), f"chapter_{chapter_index}"
+            )
+            if not original_name.lower().endswith((".xhtml", ".html", ".htm")):
+                original_name += ".xhtml"
+            if original_name.lower().endswith((".html", ".htm")):
+                original_name = re.sub(r"\.html?$", ".xhtml", original_name)
+
+            unique_name = make_unique_name(original_name, used_chapter_names)
+            chapter_zip_path = safe_output_zip_path("text", unique_name)
+            chapter_href = chapter_zip_path
+
+            ET.register_namespace("", XHTML_NS)
+            ET.register_namespace("epub", epub_ns)
+            ET.register_namespace("svg", SVG_NS)
+            ET.register_namespace("xlink", XLINK_NS)
+
+            chapter_bytes = ET.tostring(
+                root, encoding="utf-8", xml_declaration=True, method="xml"
+            )
+
+            chapters_out.append((chapter_href, chapter_title, chapter_bytes))
+            chapter_index += 1
+
+    return chapters_out, images_out
+
+
+async def compile_selected_epubs(
+    selected: List[EpubEntry],
+    title: str,
+    author: str,
+) -> Tuple[Optional[bytes], List[Tuple[str, str]]]:
+    used_chapter_names: Set[str] = set()
+    used_image_names: Set[str] = set()
+    final_chapters: List[Tuple[str, str, bytes]] = []
+    final_images: Dict[str, bytes] = {}
+    skipped: List[Tuple[str, str]] = []
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        for entry in selected:
+            try:
+                epub_bytes = await fetch_epub_bytes(http, entry)
+                chapters, images = extract_book_content(
+                    epub_bytes=epub_bytes,
+                    used_chapter_names=used_chapter_names,
+                    used_image_names=used_image_names,
+                )
+                if not chapters:
+                    skipped.append((entry.filename, "No usable chapter files found"))
+                    log(
+                        f"Skipped {entry.filename}: "
+                        "No usable chapter files found"
+                    )
+                    continue
+
+                final_chapters.extend(chapters)
+                final_images.update(images)
+            except zipfile.BadZipFile:
+                skipped.append((entry.filename, "Invalid EPUB/ZIP"))
+                log(f"Skipped {entry.filename}: Invalid EPUB/ZIP")
+            except KeyError as exc:
+                skipped.append((entry.filename, f"Missing file: {exc}"))
+                log(f"Skipped {entry.filename}: Missing file: {exc}")
+            except Exception as exc:
+                skipped.append((entry.filename, str(exc)[:200]))
+                log(f"Skipped {entry.filename}: {exc}")
+
+    if not final_chapters:
+        return None, skipped
+
+    chapter_toc = [(href, label) for href, label, _ in final_chapters]
+    uid = f"urn:uuid:{uuid.uuid4()}"
+
+    with io.BytesIO() as out:
+        with zipfile.ZipFile(out, "w") as zf:
+            mimetype_info = zipfile.ZipInfo("mimetype")
+            mimetype_info.compress_type = zipfile.ZIP_STORED
+            zf.writestr(mimetype_info, b"application/epub+zip")
+
+            zf.writestr(
+                "META-INF/container.xml",
+                make_container_xml(),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            zf.writestr(
+                "OEBPS/styles/main.css",
+                build_simple_stylesheet(),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            zf.writestr(
+                "OEBPS/nav.xhtml",
+                make_nav_xhtml(chapter_toc),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            zf.writestr(
+                "OEBPS/toc.ncx",
+                make_toc_ncx(chapter_toc, uid, title),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            zf.writestr(
+                "OEBPS/content.opf",
+                make_content_opf(
+                    uid=uid,
+                    title_text=title,
+                    author=author,
+                    chapters=chapter_toc,
+                    image_names=sorted(final_images.keys()),
+                ),
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+            for href, _, chapter_bytes in final_chapters:
+                zf.writestr(
+                    f"OEBPS/{href}",
+                    chapter_bytes,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+
+            for image_name, image_bytes in final_images.items():
+                zf.writestr(
+                    f"OEBPS/{safe_output_zip_path('images', image_name)}",
+                    image_bytes,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+
+        return out.getvalue(), skipped
+
+
+@bot.tree.command(name="compile", description="Select EPUBs from this channel")
+async def compile_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Use this command in a server channel.",
+            ephemeral=True,
+        )
+        return
+
+    channel_name = getattr(interaction.channel, "name", "Discord Channel")
+    log(
+        f"/compile run by {interaction.user} in #{channel_name}"
+    )
+
+    key = build_session_key(interaction.user.id, interaction.channel.id)
+    session = CompileSession(
+        user_id=interaction.user.id,
+        channel_id=interaction.channel.id,
+        channel_name=channel_name,
+    )
+    SESSIONS[key] = session
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    ok, error = await scan_for_epubs(
+        channel=interaction.channel,
+        session=session,
+        target_new_count=INITIAL_LOAD_ATTACHMENTS,
+    )
+    if not ok:
+        log(f"Couldn't scan #{channel_name}")
+        SESSIONS.pop(key, None)
+        await interaction.followup.send(
+            error or "Failed to scan channel.", ephemeral=True
+        )
+        return
+
+    if not session.entries:
+        log(f"No EPUBs found in #{channel_name}")
+        SESSIONS.pop(key, None)
+        await interaction.followup.send(
+            "No EPUB attachments found in this channel.",
+            ephemeral=True,
+        )
+        return
+
+    log(f"Found {len(session.entries)} EPUB(s) in #{channel_name}")
+
+    view = CompileView(session)
+    msg = await interaction.followup.send(
+        content=view.render_content(),
+        view=view,
+        ephemeral=True,
+        wait=True,
+    )
+    view.message = msg
+
+
+@bot.event
+async def on_ready() -> None:
+    log(f"Logged in as {bot.user}")
+    if not getattr(bot, "_cleanup_started", False):
+        bot._cleanup_started = True
+        asyncio.create_task(cleanup_sessions())
+        log("Cleanup task started")
+
+    if not getattr(bot, "_synced", False):
+        bot._synced = True
+        try:
+            synced = await bot.tree.sync()
+            log(f"Synced {len(synced)} command(s)")
+        except Exception as exc:
+            log(f"Command sync failed: {exc}")
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("Set DISCORD_TOKEN in your environment.")
+    bot.run(TOKEN)
