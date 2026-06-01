@@ -30,6 +30,7 @@ SESSION_TIMEOUT_SECONDS = 15 * 60
 MAX_SESSION_LIFETIME_SECONDS = 60 * 60
 INITIAL_LOAD_ATTACHMENTS = 100
 PAGE_SIZE = 25
+MAX_MESSAGES_SCANNED_PER_PASS = 1000
 
 MAX_SOURCE_EPUB_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
@@ -654,7 +655,9 @@ class CompileLayoutView(discord.ui.LayoutView):
             self.add_item(
                 discord.ui.Container(
                     discord.ui.TextDisplay(
-                        "**Scan**: Partial — older results not loaded yet."
+                        "**Scan**: Partial — only part of channel history has "
+                        "been scanned so far. Use Next to keep loading older "
+                        "results."
                     ),
                     accent_colour=discord.Colour.orange(),
                 )
@@ -886,6 +889,7 @@ async def scan_for_epubs(
     session: CompileSession,
     target_new_count: int,
 ) -> Tuple[bool, Optional[str]]:
+    scanned_messages = 0
     async with session.lock:
         if session.scan_in_progress or session.scan_complete:
             return True, None
@@ -900,6 +904,8 @@ async def scan_for_epubs(
                     break
 
                 if len(session.entries) - start_count >= target_new_count:
+                    break
+                if scanned_messages >= MAX_MESSAGES_SCANNED_PER_PASS:
                     break
 
                 before_id = session.scan_before_message_id
@@ -922,6 +928,8 @@ async def scan_for_epubs(
                 async with session.lock:
                     session.scan_complete = True
                 break
+
+            scanned_messages += len(batch)
 
             async with session.lock:
                 for msg in batch:
