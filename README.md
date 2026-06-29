@@ -30,6 +30,8 @@ The bot imports EPUBs as messages arrive and during watched-channel backfills. C
   - Read Message History
   - Send Messages
   - Attach Files
+- Privileged Gateway Intents enabled in the Discord Developer Portal:
+  - Message Content Intent
 - Application command scope:
   - `applications.commands`
 
@@ -99,6 +101,7 @@ Keep all three files together while the bot is running. They are normal SQLite s
 
 - The bot is single-guild only. Set `GUILD_ID` or `DISCORD_GUILD_ID`.
 - Compile-time source retrieval is DB-backed.
+- Live ingestion depends on Message Content Intent so Discord includes attachment metadata in message events.
 - Deleted EPUBs are soft-deleted and can be restored from `/compile action:delete`.
 - Reorder is blocked until a channel's historical scan is complete.
 
