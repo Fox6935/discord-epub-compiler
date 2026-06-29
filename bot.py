@@ -262,6 +262,11 @@ async def on_ready() -> None:
         log("Intent warning: guilds intent is disabled")
     if not bot.intents.messages:
         log("Intent warning: guild messages intent is disabled")
+    if not bot.intents.message_content:
+        log(
+            "Intent warning: message content intent is disabled; "
+            "live attachment ingestion may not see new EPUB uploads"
+        )
 
     if not getattr(bot, "_cleanup_started", False):
         bot._cleanup_started = True
