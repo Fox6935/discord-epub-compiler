@@ -8,7 +8,7 @@ import sqlite3
 import zlib
 import zipfile
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from config import DB_PATH, GUILD_ID
 from epub_tools import (
@@ -99,9 +99,12 @@ def load_blob_payload(compression: str, data: bytes) -> bytes:
     raise ValueError(f"Unsupported blob compression: {compression}")
 
 
-def parse_opf_metadata_from_zip(zf: zipfile.ZipFile) -> Tuple[str, str, Dict[str, str], Dict[str, int]]:
+def parse_opf_metadata_from_zip(
+    zf: zipfile.ZipFile,
+) -> Tuple[str, str, Dict[str, str], Dict[str, int], Set[str]]:
     manifest_types: Dict[str, str] = {}
     spine_orders: Dict[str, int] = {}
+    cover_image_paths: Set[str] = set()
     title = ""
     creator = ""
 
@@ -110,7 +113,9 @@ def parse_opf_metadata_from_zip(zf: zipfile.ZipFile) -> Tuple[str, str, Dict[str
         opf_dir, manifest, spine, _ = parse_opf(zf, opf_path)
         root = parse_xml(safe_zip_read(zf, opf_path))
     except Exception:
-        return title, creator, manifest_types, spine_orders
+        return title, creator, manifest_types, spine_orders, cover_image_paths
+
+    cover_item_ids: Set[str] = set()
 
     for elem in root.iter():
         lname = local_name(elem.tag).lower()
@@ -118,16 +123,30 @@ def parse_opf_metadata_from_zip(zf: zipfile.ZipFile) -> Tuple[str, str, Dict[str
             title = get_text_content(elem)
         elif lname in {"creator", "author"} and not creator:
             creator = get_text_content(elem)
+        elif lname == "meta" and (elem.get("name") or "").lower() == "cover":
+            content = elem.get("content")
+
+            if content:
+                cover_item_ids.add(content)
 
     for item_id, item in manifest.items():
         manifest_types[item["href"]] = item.get("media_type") or guess_media_type(item["href"])
+
+        if (
+            "image/" in manifest_types[item["href"]]
+            and (
+                "cover-image" in {p.strip().lower() for p in item.get("properties", "").split()}
+                or item_id in cover_item_ids
+            )
+        ):
+            cover_image_paths.add(item["href"])
 
     for index, item_id in enumerate(spine, start=1):
         item = manifest.get(item_id)
         if item:
             spine_orders[item["href"]] = index
 
-    return title, creator, manifest_types, spine_orders
+    return title, creator, manifest_types, spine_orders, cover_image_paths
 
 
 def compute_epub_fingerprint(components: List[Tuple[str, bytes]]) -> bytes:
@@ -207,6 +226,7 @@ class ArchiveDB:
               size_uncompressed INTEGER NOT NULL,
               spine_order INTEGER,
               is_manifest_item INTEGER NOT NULL DEFAULT 1,
+              is_cover_image INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(epub_version_id, internal_path),
               FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
               FOREIGN KEY(blob_hash) REFERENCES blob(hash)
@@ -287,6 +307,58 @@ class ArchiveDB:
             CREATE INDEX IF NOT EXISTS import_failure_channel_idx ON import_failure(channel_id, message_id);
             """
         )
+        added_cover_column = self._ensure_column_sync(
+            conn,
+            "epub_component",
+            "is_cover_image",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+
+        if added_cover_column:
+            self._backfill_cover_image_flags_sync(conn)
+
+    def _ensure_column_sync(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> bool:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+        if column in columns:
+            return False
+
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return True
+
+    def _backfill_cover_image_flags_sync(self, conn: sqlite3.Connection) -> None:
+        version_rows = conn.execute("SELECT id FROM epub_version").fetchall()
+
+        for row in version_rows:
+            try:
+                epub_bytes = self._reconstruct_epub_sync(conn, row["id"])
+
+                with zipfile.ZipFile(io.BytesIO(epub_bytes), "r") as zf:
+                    _, _, _, _, cover_image_paths = parse_opf_metadata_from_zip(zf)
+            except Exception:
+                continue
+
+            if not cover_image_paths:
+                continue
+
+            placeholders = ",".join("?" for _ in cover_image_paths)
+            conn.execute(
+                f"""
+                UPDATE epub_component
+                SET is_cover_image = 1
+                WHERE epub_version_id = ? AND internal_path IN ({placeholders})
+                """,
+                [row["id"], *cover_image_paths],
+            )
 
     async def list_channel_epubs(
         self,
@@ -339,15 +411,66 @@ class ArchiveDB:
         deleted_filter = "" if include_deleted else "AND is_deleted = 0"
         rows = conn.execute(
             f"""
-            SELECT id, channel_id, message_id, attachment_index, discord_filename,
-                   attachment_size, message_created_at, epub_version_id, effective_order,
-                   is_deleted
-            FROM discord_epub
-            WHERE guild_id = ? AND channel_id = ? {deleted_filter}
-            ORDER BY effective_order DESC
+            SELECT
+              d.id,
+              d.channel_id,
+              d.message_id,
+              d.attachment_index,
+              d.discord_filename,
+              d.attachment_size,
+              d.message_created_at,
+              d.epub_version_id,
+              d.effective_order,
+              d.is_deleted,
+              COALESCE(
+                SUM(
+                  CASE
+                    WHEN c.spine_order IS NOT NULL
+                     AND c.media_type IN ('application/xhtml+xml', 'text/html', 'application/xml')
+                    THEN c.size_uncompressed
+                    ELSE 0
+                  END
+                ),
+                0
+              ) AS estimated_chapter_bytes
+            FROM discord_epub d
+            LEFT JOIN epub_component c ON c.epub_version_id = d.epub_version_id
+            WHERE d.guild_id = ? AND d.channel_id = ? {deleted_filter}
+            GROUP BY d.id
+            ORDER BY d.effective_order DESC
             """,
             (GUILD_ID, channel_id),
         ).fetchall()
+
+        image_blob_sizes_by_version: Dict[int, List[Tuple[str, int]]] = {}
+        version_ids = [row["epub_version_id"] for row in rows]
+
+        if version_ids:
+            placeholders = ",".join("?" for _ in version_ids)
+            image_rows = conn.execute(
+                f"""
+                SELECT epub_version_id, hex(blob_hash) AS blob_hash, MAX(size_uncompressed) AS size_uncompressed
+                FROM epub_component
+                WHERE epub_version_id IN ({placeholders})
+                  AND media_type LIKE 'image/%'
+                  AND media_type != 'image/svg+xml'
+                  AND is_cover_image = 0
+                GROUP BY epub_version_id, blob_hash
+                """,
+                version_ids,
+            ).fetchall()
+
+            for image_row in image_rows:
+                image_blob_sizes_by_version.setdefault(
+                    image_row["epub_version_id"],
+                    [],
+                ).append(
+                    (
+                        image_row["blob_hash"],
+                        image_row["size_uncompressed"],
+                    )
+                )
+
         return [
             EpubEntry(
                 entry_id=str(row["id"]),
@@ -361,6 +484,17 @@ class ArchiveDB:
                 created_at=unix_to_dt(row["message_created_at"]),
                 effective_order=row["effective_order"],
                 is_deleted=bool(row["is_deleted"]),
+                estimated_chapter_bytes=row["estimated_chapter_bytes"],
+                estimated_image_bytes=sum(
+                    size
+                    for _, size in image_blob_sizes_by_version.get(
+                        row["epub_version_id"],
+                        [],
+                    )
+                ),
+                image_blob_sizes=tuple(
+                    image_blob_sizes_by_version.get(row["epub_version_id"], [])
+                ),
             )
             for row in rows
         ]
@@ -441,7 +575,7 @@ class ArchiveDB:
             validate_zip_member_names(zf)
             validate_zip_sizes(zf)
             validate_epub_basics(zf)
-            title, creator, manifest_types, spine_orders = parse_opf_metadata_from_zip(zf)
+            title, creator, manifest_types, spine_orders, cover_image_paths = parse_opf_metadata_from_zip(zf)
             canonical_key = normalize_key(f"{title} {creator}" if title else filename)
             book_row = conn.execute(
                 "SELECT id FROM book WHERE canonical_key = ?",
@@ -456,7 +590,7 @@ class ArchiveDB:
                 )
                 book_id = cur.lastrowid
 
-            components: List[Tuple[str, str, bytes, str, bytes, int, Optional[int], int]] = []
+            components: List[Tuple[str, str, bytes, str, bytes, int, Optional[int], int, int]] = []
             fingerprint_parts: List[Tuple[str, bytes]] = []
 
             for info in zf.infolist():
@@ -469,7 +603,8 @@ class ArchiveDB:
                 compression, stored = store_blob_payload(internal_path, media_type, data)
                 spine_order = spine_orders.get(internal_path)
                 is_manifest_item = 1 if internal_path in manifest_types or internal_path == "mimetype" else 0
-                components.append((internal_path, media_type, blob_hash, compression, stored, len(data), spine_order, is_manifest_item))
+                is_cover_image = 1 if internal_path in cover_image_paths else 0
+                components.append((internal_path, media_type, blob_hash, compression, stored, len(data), spine_order, is_manifest_item, is_cover_image))
                 fingerprint_parts.append((internal_path, blob_hash))
 
             fingerprint = compute_epub_fingerprint(fingerprint_parts)
@@ -482,7 +617,7 @@ class ArchiveDB:
             )
             epub_version_id = cur.lastrowid
 
-            for internal_path, media_type, blob_hash, compression, stored, size_uncompressed, spine_order, is_manifest_item in components:
+            for internal_path, media_type, blob_hash, compression, stored, size_uncompressed, spine_order, is_manifest_item, is_cover_image in components:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO blob(hash, media_type, size_uncompressed, size_stored, compression, data, first_seen_at)
@@ -493,10 +628,10 @@ class ArchiveDB:
                 conn.execute("UPDATE blob SET refcount = refcount + 1 WHERE hash = ?", (blob_hash,))
                 conn.execute(
                     """
-                    INSERT INTO epub_component(epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO epub_component(epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item),
+                    (epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image),
                 )
 
             watch_row = conn.execute(
