@@ -234,7 +234,7 @@ async def scan_command(
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not is_configured_guild(message.guild):
+    if not is_configured_guild(message.guild):
         return
 
     row = await get_watched_channel_row(message.channel.id)
