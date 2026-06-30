@@ -18,6 +18,9 @@ from models import (
 )
 
 
+WARNING_MARK = "\u26a0\ufe0f"
+
+
 class EpubPickerSelect(discord.ui.Select):
     def __init__(self, session: CompileSession):
         page_entries = session.current_page_entries()
@@ -31,11 +34,12 @@ class EpubPickerSelect(discord.ui.Select):
         for entry in page_entries:
             created = entry.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
             if session.flow_mode == "delete" and entry.is_deleted:
-                label = f"⚠️{entry.filename}⚠️"
+                label = f"{WARNING_MARK}{entry.filename}{WARNING_MARK}"
             else:
                 label = entry.filename
             label = label[:100]
-            description = f"{created} - msg {entry.message_id}"
+            size = format_bytes(entry.attachment_size or 0)
+            description = f"{created} - {size}"
             if session.flow_mode == "delete" and entry.is_deleted:
                 description = f"Deleted - {description}"
 
@@ -145,6 +149,54 @@ class NextPageButton(discord.ui.Button["CompileLayoutView"]):
 
             if view.session.current_page < view.session.page_count - 1:
                 view.session.current_page += 1
+
+            new_view = CompileLayoutView(view.session)
+            new_view.message = view.message
+
+        await interaction.response.edit_message(view=new_view)
+
+
+class FirstPageButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, disabled: bool):
+        super().__init__(
+            label="First",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+
+        if view is None:
+            return
+
+        async with view.session.lock:
+            view.session.touch()
+            view.session.current_page = 0
+
+            new_view = CompileLayoutView(view.session)
+            new_view.message = view.message
+
+        await interaction.response.edit_message(view=new_view)
+
+
+class LastPageButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, disabled: bool):
+        super().__init__(
+            label="Last",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+
+        if view is None:
+            return
+
+        async with view.session.lock:
+            view.session.touch()
+            view.session.current_page = view.session.page_count - 1
 
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
@@ -325,16 +377,25 @@ class CompileLayoutView(discord.ui.LayoutView):
             if session.flow_mode == "reorder_place"
             else len(session.selected_ids)
         )
+        stats_lines = [
+            f"**EPUBs**: {display_total}",
+            f"**Selected**: {selected_count}",
+            f"**Page**: {session.current_page + 1}/{session.page_count}",
+        ]
+
+        if session.flow_mode == "compile":
+            estimated_size = session.estimated_output_bytes()
+
+            if estimated_size is not None:
+                stats_lines.append(
+                    f"**Estimated output**: {format_bytes(estimated_size)}"
+                )
 
         stats = discord.ui.Container(
             discord.ui.TextDisplay(title),
             discord.ui.TextDisplay(f"Select EPUBs from <#{session.channel_id}>"),
             discord.ui.Separator(),
-            discord.ui.TextDisplay(
-                f"**EPUBs**: {display_total}\n"
-                f"**Selected**: {selected_count}\n"
-                f"**Page**: {session.current_page + 1}/{session.page_count}"
-            ),
+            discord.ui.TextDisplay("\n".join(stats_lines)),
             accent_colour=discord.Colour.blurple(),
         )
         self.add_item(stats)
@@ -361,8 +422,10 @@ class CompileLayoutView(discord.ui.LayoutView):
 
         self.add_item(
             discord.ui.ActionRow(
+                FirstPageButton(disabled=session.current_page == 0),
                 PrevPageButton(disabled=session.current_page == 0),
                 NextPageButton(disabled=next_disabled),
+                LastPageButton(disabled=next_disabled),
             )
         )
 
