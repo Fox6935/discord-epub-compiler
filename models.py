@@ -3,7 +3,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
-from config import MAX_CONCURRENT_COMPILES, PAGE_SIZE
+from config import (
+    CHAPTER_ZIP_COMPRESSION_RATIO,
+    EPUB_SHELL_OVERHEAD_BYTES,
+    MAX_CONCURRENT_COMPILES,
+    PAGE_SIZE,
+)
 
 
 class OutputTooLargeError(ValueError):
@@ -32,6 +37,9 @@ class EpubEntry:
     created_at: datetime
     effective_order: int
     is_deleted: bool = False
+    estimated_chapter_bytes: int = 0
+    estimated_image_bytes: int = 0
+    image_blob_sizes: Tuple[Tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -101,6 +109,30 @@ class CompileSession:
         selected = [e for e in self.entries if e.entry_id in self.selected_ids]
         selected.sort(key=lambda e: e.effective_order)
         return selected
+
+    def estimated_output_bytes(self) -> Optional[int]:
+        selected = self.sort_selected_for_compile()
+
+        if not selected:
+            return None
+
+        chapter_bytes = sum(entry.estimated_chapter_bytes for entry in selected)
+        image_bytes = 0
+
+        if not self.remove_all_images:
+            image_sizes_by_hash: Dict[str, int] = {}
+
+            for entry in selected:
+                for blob_hash, blob_size in entry.image_blob_sizes:
+                    image_sizes_by_hash.setdefault(blob_hash, blob_size)
+
+            image_bytes = sum(image_sizes_by_hash.values())
+
+        return (
+            int(chapter_bytes * CHAPTER_ZIP_COMPRESSION_RATIO)
+            + image_bytes
+            + EPUB_SHELL_OVERHEAD_BYTES
+        )
 
     def all_selected_on_page(self) -> bool:
         page_entries = self.current_page_entries()
