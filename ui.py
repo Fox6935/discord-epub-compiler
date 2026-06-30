@@ -14,7 +14,8 @@ from epub_tools import (
     sanitize_author, sanitize_output_name,
 )
 from models import (
-    COMPILE_SEMAPHORE, CompileSession, OutputTooLargeError, is_session_live, log,
+    COMPILE_SEMAPHORE, CompileSession, DEBUG_LOGS, OutputTooLargeError,
+    is_session_live, log, log_success, log_warning,
 )
 
 
@@ -565,12 +566,13 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     max_output_bytes=upload_limit,
                 )
         except OutputTooLargeError as exc:
-            log(f"Compile too large for {interaction.user}: {exc}")
+            log_warning(f"Compile too large for {interaction.user}: {exc}")
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         except Exception as exc:
-            log(f"Compile failed for {interaction.user}: {exc}")
-            traceback.print_exc()
+            log_warning(f"Compile failed for {interaction.user}: {exc}")
+            if DEBUG_LOGS:
+                traceback.print_exc()
             await interaction.followup.send(
                 f"Compile failed: {exc}",
                 ephemeral=True,
@@ -578,7 +580,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             return
 
         if output_bytes is None:
-            log(f"All selected EPUBs failed for {interaction.user}")
+            log_warning(f"All selected EPUBs failed for {interaction.user}")
             detail = "\n".join(f"- {name}: {reason}" for name, reason in skipped)
             msg = "All selected EPUBs failed."
 
@@ -605,7 +607,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                 ephemeral=True,
             )
         except discord.HTTPException as exc:
-            log(f"Couldn't send compiled EPUB to {interaction.user}: {exc}")
+            log_warning(f"Couldn't send compiled EPUB to {interaction.user}: {exc}")
             await interaction.followup.send(
                 (
                     "I couldn't send the compiled EPUB through Discord.\n"
@@ -617,7 +619,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             )
             return
 
-        log(f"{len(selected)} EPUB(s) compiled and sent to {interaction.user}")
+        log_success(f"{len(selected)} EPUB(s) compiled and sent to {interaction.user}")
 
 
 class OpenPlacementPickerButton(discord.ui.Button["CompileLayoutView"]):

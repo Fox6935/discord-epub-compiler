@@ -1,4 +1,8 @@
 import asyncio
+import logging
+import os
+import shutil
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
@@ -15,9 +19,145 @@ class OutputTooLargeError(ValueError):
     pass
 
 
-def log(msg: str) -> None:
+DEBUG_LOGS = os.getenv("DEBUG_LOGS", "").lower() in {"1", "true", "yes", "on"}
+USE_COLOR = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+USE_PROGRESS = sys.stdout.isatty()
+
+GREEN = "\033[32m"
+ORANGE = "\033[33m"
+RESET = "\033[0m"
+
+if not DEBUG_LOGS:
+    for logger_name in ("discord", "discord.client", "discord.gateway", "aiohttp"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG_LOGS else logging.WARNING,
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+_ACTIVE_PROGRESS: Optional["ScanProgress"] = None
+
+
+def _terminal_width() -> int:
+    return max(shutil.get_terminal_size((100, 20)).columns, 40)
+
+
+def _colorize(msg: str, level: str) -> str:
+    if not USE_COLOR:
+        return msg
+
+    if level == "success":
+        return f"{GREEN}{msg}{RESET}"
+
+    if level == "warning":
+        return f"{ORANGE}{msg}{RESET}"
+
+    return msg
+
+
+def _clear_progress_line() -> None:
+    if USE_PROGRESS:
+        sys.stdout.write("\r" + (" " * (_terminal_width() - 1)) + "\r")
+        sys.stdout.flush()
+
+
+def _write_progress_line(msg: str) -> None:
+    if not USE_PROGRESS:
+        return
+
+    width = _terminal_width()
+    clean = msg[: width - 1]
+    sys.stdout.write("\r" + clean.ljust(width - 1))
+    sys.stdout.flush()
+
+
+def _write_log(msg: str, level: str = "info") -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}", flush=True)
+    print(f"[{timestamp}] {_colorize(msg, level)}", flush=True)
+
+
+def log(msg: str, level: str = "info") -> None:
+    active = _ACTIVE_PROGRESS
+
+    if active is not None and active.started:
+        _clear_progress_line()
+
+    _write_log(msg, level)
+
+    if active is not None and active.started:
+        active.render()
+
+
+def log_success(msg: str) -> None:
+    log(msg, "success")
+
+
+def log_warning(msg: str) -> None:
+    log(msg, "warning")
+
+
+class ScanProgress:
+    def __init__(self, channel_name: str):
+        self.channel_name = channel_name
+        self.scanned_messages = 0
+        self.archived_epubs = 0
+        self.started = False
+        self.current_filename: Optional[str] = None
+
+    def start(self) -> None:
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = self
+        self.started = True
+        log(f"Starting scan in #{self.channel_name}")
+        self.render()
+
+    def update(self, current_filename: Optional[str] = None) -> None:
+        if current_filename:
+            self.current_filename = current_filename
+        self.render()
+
+    def render(self) -> None:
+        if not self.started:
+            return
+
+        line = (
+            f"Scanning #{self.channel_name} - "
+            f"Scanned {self.scanned_messages} messages - "
+            f"Archived {self.archived_epubs} EPUBs"
+        )
+
+        if self.current_filename:
+            line += f" - {self.current_filename}"
+
+        _write_progress_line(_colorize(line, "info"))
+
+    def finish(self) -> None:
+        global _ACTIVE_PROGRESS
+
+        if self.started:
+            _clear_progress_line()
+            self.started = False
+
+        if _ACTIVE_PROGRESS is self:
+            _ACTIVE_PROGRESS = None
+
+        log_success(
+            f"Scan complete in #{self.channel_name} - "
+            f"Scanned {self.scanned_messages} messages - "
+            f"Archived {self.archived_epubs} EPUBs"
+        )
+
+    def stop_without_summary(self) -> None:
+        global _ACTIVE_PROGRESS
+
+        if self.started:
+            _clear_progress_line()
+            self.started = False
+
+        if _ACTIVE_PROGRESS is self:
+            _ACTIVE_PROGRESS = None
 
 
 def now_utc() -> datetime:

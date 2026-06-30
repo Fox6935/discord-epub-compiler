@@ -9,7 +9,7 @@ from epub_tools import (
     build_compiled_epub_bytes, estimate_compiled_epub_bytes, extract_book_content,
     format_bytes,
 )
-from models import EpubEntry, OutputTooLargeError, log
+from models import EpubEntry, OutputTooLargeError, DEBUG_LOGS, log_warning
 
 
 async def compile_selected_epubs(
@@ -41,7 +41,7 @@ async def compile_selected_epubs(
 
             if not chapters:
                 skipped.append((entry.filename, "No usable chapter files found"))
-                log(f"Skipped {entry.filename}: No usable chapter files found")
+                log_warning(f"Skipped {entry.filename}: No usable chapter files found")
                 continue
 
             final_chapters.extend(chapters)
@@ -80,14 +80,15 @@ async def compile_selected_epubs(
             raise
         except zipfile.BadZipFile:
             skipped.append((entry.filename, "Invalid archived EPUB/ZIP"))
-            log(f"Skipped {entry.filename}: Invalid archived EPUB/ZIP")
+            log_warning(f"Skipped {entry.filename}: Invalid archived EPUB/ZIP")
         except KeyError as exc:
             skipped.append((entry.filename, f"Missing file: {exc}"))
-            log(f"Skipped {entry.filename}: Missing file: {exc}")
+            log_warning(f"Skipped {entry.filename}: Missing file: {exc}")
         except Exception as exc:
             skipped.append((entry.filename, str(exc)[:200]))
-            log(f"Skipped {entry.filename}: {exc}")
-            traceback.print_exc()
+            log_warning(f"Skipped {entry.filename}: {exc}")
+            if DEBUG_LOGS:
+                traceback.print_exc()
 
     if not final_chapters:
         return None, skipped

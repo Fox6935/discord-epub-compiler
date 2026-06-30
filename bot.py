@@ -10,11 +10,12 @@ from config import (
 )
 from db import ARCHIVE, get_watched_channel_row, update_channel_cursor
 from ingestion import (
-    category_reconcile_loop, cleanup_sessions, import_message_epubs,
-    reconcile_watched_category, retry_channel_import_failures, start_historical_scan,
+    category_reconcile_loop, cleanup_sessions, enqueue_historical_scan,
+    ensure_scan_worker_started, import_message_epubs, reconcile_watched_category,
+    retry_channel_import_failures,
     startup_channel_work, upsert_watched_category, upsert_watched_channel,
 )
-from models import CompileSession, SESSIONS, build_session_key, log
+from models import CompileSession, SESSIONS, build_session_key, log, log_success, log_warning
 from ui import CompileLayoutView
 
 
@@ -102,7 +103,7 @@ async def compile_command(
         found_count = len(session.entries)
 
     if not found_count:
-        log(f"No EPUBs found in #{channel_name}")
+        log_warning(f"No EPUBs found in #{channel_name}")
         session.expired = True
         SESSIONS.pop(key, None)
         await interaction.followup.send(
@@ -174,8 +175,12 @@ async def scan_command(
         watched = await get_watched_channel_row(channel.id)
 
         if watched is not None and not watched["historical_scan_complete"]:
-            asyncio.create_task(start_historical_scan(channel))
-            scan_note = "Historical backfill has started or resumed."
+            queued = await enqueue_historical_scan(channel)
+            scan_note = (
+                "Historical backfill was queued."
+                if queued
+                else "Historical backfill is already queued or running."
+            )
         else:
             scan_note = "Historical backfill is already complete."
 
@@ -250,20 +255,20 @@ async def on_ready() -> None:
     guild = get_configured_guild()
 
     if guild is None:
-        log(
+        log_warning(
             f"Configured guild {GUILD_ID} is not available to this bot. "
             "Check that GUILD_ID is the server ID for the bot's installed server "
             "and that this application has been invited there with the bot scope."
         )
     else:
-        log(f"Configured single guild: {guild.name} ({guild.id})")
+        log_success(f"Configured single guild: {guild.name} ({guild.id})")
 
     if not bot.intents.guilds:
-        log("Intent warning: guilds intent is disabled")
+        log_warning("Intent warning: guilds intent is disabled")
     if not bot.intents.messages:
-        log("Intent warning: guild messages intent is disabled")
+        log_warning("Intent warning: guild messages intent is disabled")
     if not bot.intents.message_content:
-        log(
+        log_warning(
             "Intent warning: message content intent is disabled; "
             "live attachment ingestion may not see new EPUB uploads"
         )
@@ -271,6 +276,7 @@ async def on_ready() -> None:
     if not getattr(bot, "_cleanup_started", False):
         bot._cleanup_started = True
         asyncio.create_task(cleanup_sessions())
+        ensure_scan_worker_started()
         log("Cleanup task started")
 
     if guild is not None and not getattr(bot, "_guild_work_started", False):
@@ -278,11 +284,11 @@ async def on_ready() -> None:
         asyncio.create_task(category_reconcile_loop())
         asyncio.create_task(startup_channel_work())
     elif guild is None and not getattr(bot, "_guild_work_started", False):
-        log("Guild-dependent startup work skipped because configured guild is unavailable")
+        log_warning("Guild-dependent startup work skipped because configured guild is unavailable")
 
     if not getattr(bot, "_synced", False):
         if guild is None:
-            log("Guild command sync skipped because configured guild is unavailable")
+            log_warning("Guild command sync skipped because configured guild is unavailable")
             return
 
         try:
@@ -290,15 +296,15 @@ async def on_ready() -> None:
             bot.tree.copy_global_to(guild=guild_object)
             synced = await bot.tree.sync(guild=guild_object)
             bot._synced = True
-            log(f"Synced {len(synced)} guild command(s) for {GUILD_ID}")
+            log_success(f"Synced {len(synced)} guild command(s) for {GUILD_ID}")
         except discord.Forbidden:
             bot._synced = True
-            log(
+            log_warning(
                 f"Command sync failed: missing access to guild {GUILD_ID}. "
                 "Reinvite the bot/application to that server with bot and applications.commands scopes."
             )
         except Exception as exc:
-            log(f"Command sync failed: {exc}")
+            log_warning(f"Command sync failed: {exc}")
 
 
 if __name__ == "__main__":
