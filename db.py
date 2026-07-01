@@ -196,105 +196,112 @@ class ArchiveDB:
             CREATE TABLE IF NOT EXISTS book (
               id INTEGER PRIMARY KEY,
               canonical_key TEXT,
-              first_seen_at INTEGER NOT NULL
+              first_seen_at INTEGER NOT NULL CHECK(first_seen_at >= 0)
             );
             CREATE TABLE IF NOT EXISTS epub_version (
               id INTEGER PRIMARY KEY,
               book_id INTEGER,
-              original_filename TEXT NOT NULL,
-              imported_at INTEGER NOT NULL,
-              source_size INTEGER,
-              epub_fingerprint BLOB,
-              component_count INTEGER,
+              original_filename TEXT NOT NULL CHECK(length(original_filename) > 0),
+              imported_at INTEGER NOT NULL CHECK(imported_at >= 0),
+              source_size INTEGER CHECK(source_size IS NULL OR source_size >= 0),
+              epub_fingerprint BLOB CHECK(epub_fingerprint IS NULL OR length(epub_fingerprint) = 32),
+              component_count INTEGER CHECK(component_count IS NULL OR component_count >= 0),
               FOREIGN KEY(book_id) REFERENCES book(id)
             );
             CREATE TABLE IF NOT EXISTS blob (
-              hash BLOB PRIMARY KEY,
+              hash BLOB PRIMARY KEY CHECK(length(hash) = 32),
               media_type TEXT,
-              size_uncompressed INTEGER NOT NULL,
-              size_stored INTEGER NOT NULL,
-              compression TEXT NOT NULL,
-              data BLOB NOT NULL,
-              refcount INTEGER NOT NULL DEFAULT 0,
-              first_seen_at INTEGER NOT NULL
+              size_uncompressed INTEGER NOT NULL CHECK(size_uncompressed >= 0),
+              size_stored INTEGER NOT NULL CHECK(size_stored >= 0 AND size_stored = length(data)),
+              compression TEXT NOT NULL CHECK(compression IN ('none', 'deflate')),
+              data BLOB NOT NULL CHECK(length(data) >= 0),
+              refcount INTEGER NOT NULL DEFAULT 0 CHECK(refcount >= 0),
+              first_seen_at INTEGER NOT NULL CHECK(first_seen_at >= 0)
             );
             CREATE TABLE IF NOT EXISTS epub_component (
-              epub_version_id INTEGER NOT NULL,
-              internal_path TEXT NOT NULL,
+              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
+              internal_path TEXT NOT NULL CHECK(
+                length(internal_path) > 0
+                AND internal_path NOT LIKE '/%'
+                AND internal_path != '..'
+                AND internal_path NOT LIKE '../%'
+                AND internal_path NOT LIKE '%/../%'
+                AND internal_path NOT LIKE '%\\%'
+              ),
               media_type TEXT,
-              blob_hash BLOB NOT NULL,
-              size_uncompressed INTEGER NOT NULL,
-              spine_order INTEGER,
-              is_manifest_item INTEGER NOT NULL DEFAULT 1,
-              is_cover_image INTEGER NOT NULL DEFAULT 0,
+              blob_hash BLOB NOT NULL CHECK(length(blob_hash) = 32),
+              size_uncompressed INTEGER NOT NULL CHECK(size_uncompressed >= 0),
+              spine_order INTEGER CHECK(spine_order IS NULL OR spine_order > 0),
+              is_manifest_item INTEGER NOT NULL DEFAULT 1 CHECK(is_manifest_item IN (0, 1)),
+              is_cover_image INTEGER NOT NULL DEFAULT 0 CHECK(is_cover_image IN (0, 1)),
               PRIMARY KEY(epub_version_id, internal_path),
               FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
               FOREIGN KEY(blob_hash) REFERENCES blob(hash)
             );
             CREATE TABLE IF NOT EXISTS discord_epub (
               id INTEGER PRIMARY KEY,
-              guild_id INTEGER NOT NULL,
-              channel_id INTEGER NOT NULL,
-              message_id INTEGER NOT NULL,
-              attachment_index INTEGER NOT NULL,
-              discord_filename TEXT NOT NULL,
-              attachment_size INTEGER,
-              message_created_at INTEGER NOT NULL,
-              epub_version_id INTEGER NOT NULL,
-              effective_order INTEGER NOT NULL,
-              is_deleted INTEGER NOT NULL DEFAULT 0,
-              deleted_at INTEGER,
-              deleted_by_user_id INTEGER,
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              channel_id INTEGER NOT NULL CHECK(channel_id > 0),
+              message_id INTEGER NOT NULL CHECK(message_id > 0),
+              attachment_index INTEGER NOT NULL CHECK(attachment_index >= 0),
+              discord_filename TEXT NOT NULL CHECK(length(discord_filename) > 0),
+              attachment_size INTEGER CHECK(attachment_size IS NULL OR attachment_size >= 0),
+              message_created_at INTEGER NOT NULL CHECK(message_created_at >= 0),
+              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
+              effective_order INTEGER NOT NULL CHECK(effective_order >= 0),
+              is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+              deleted_at INTEGER CHECK(deleted_at IS NULL OR deleted_at >= 0),
+              deleted_by_user_id INTEGER CHECK(deleted_by_user_id IS NULL OR deleted_by_user_id > 0),
               delete_reason TEXT,
-              created_at INTEGER NOT NULL,
+              created_at INTEGER NOT NULL CHECK(created_at >= 0),
               FOREIGN KEY(epub_version_id) REFERENCES epub_version(id)
             );
             CREATE TABLE IF NOT EXISTS watched_channel (
-              channel_id INTEGER PRIMARY KEY,
-              guild_id INTEGER NOT NULL,
-              category_id INTEGER,
-              channel_name TEXT NOT NULL,
-              watch_enabled INTEGER NOT NULL,
-              historical_scan_complete INTEGER NOT NULL,
-              scan_anchor_message_id INTEGER,
-              historical_before_message_id INTEGER,
-              last_processed_message_id INTEGER,
-              last_scan_started_at INTEGER,
-              last_scan_finished_at INTEGER,
-              last_catchup_completed_at INTEGER,
+              channel_id INTEGER PRIMARY KEY CHECK(channel_id > 0),
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              category_id INTEGER CHECK(category_id IS NULL OR category_id > 0),
+              channel_name TEXT NOT NULL CHECK(length(channel_name) > 0),
+              watch_enabled INTEGER NOT NULL CHECK(watch_enabled IN (0, 1)),
+              historical_scan_complete INTEGER NOT NULL CHECK(historical_scan_complete IN (0, 1)),
+              scan_anchor_message_id INTEGER CHECK(scan_anchor_message_id IS NULL OR scan_anchor_message_id > 0),
+              historical_before_message_id INTEGER CHECK(historical_before_message_id IS NULL OR historical_before_message_id > 0),
+              last_processed_message_id INTEGER CHECK(last_processed_message_id IS NULL OR last_processed_message_id > 0),
+              last_scan_started_at INTEGER CHECK(last_scan_started_at IS NULL OR last_scan_started_at >= 0),
+              last_scan_finished_at INTEGER CHECK(last_scan_finished_at IS NULL OR last_scan_finished_at >= 0),
+              last_catchup_completed_at INTEGER CHECK(last_catchup_completed_at IS NULL OR last_catchup_completed_at >= 0),
               last_error TEXT
             );
             CREATE TABLE IF NOT EXISTS watched_category (
-              category_id INTEGER PRIMARY KEY,
-              guild_id INTEGER NOT NULL,
-              category_name TEXT NOT NULL,
-              watch_enabled INTEGER NOT NULL,
-              last_reconciled_at INTEGER,
+              category_id INTEGER PRIMARY KEY CHECK(category_id > 0),
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              category_name TEXT NOT NULL CHECK(length(category_name) > 0),
+              watch_enabled INTEGER NOT NULL CHECK(watch_enabled IN (0, 1)),
+              last_reconciled_at INTEGER CHECK(last_reconciled_at IS NULL OR last_reconciled_at >= 0),
               last_error TEXT
             );
             CREATE TABLE IF NOT EXISTS scan_job (
               id INTEGER PRIMARY KEY,
-              scope_type TEXT NOT NULL,
-              guild_id INTEGER NOT NULL,
-              category_id INTEGER,
-              channel_id INTEGER,
-              requested_by_user_id INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              queued_at INTEGER NOT NULL,
-              started_at INTEGER,
-              finished_at INTEGER,
+              scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'category')),
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              category_id INTEGER CHECK(category_id IS NULL OR category_id > 0),
+              channel_id INTEGER CHECK(channel_id IS NULL OR channel_id > 0),
+              requested_by_user_id INTEGER NOT NULL CHECK(requested_by_user_id > 0),
+              status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'complete', 'failed')),
+              queued_at INTEGER NOT NULL CHECK(queued_at >= 0),
+              started_at INTEGER CHECK(started_at IS NULL OR started_at >= queued_at),
+              finished_at INTEGER CHECK(finished_at IS NULL OR finished_at >= queued_at),
               error_text TEXT
             );
             CREATE TABLE IF NOT EXISTS import_failure (
-              channel_id INTEGER NOT NULL,
-              message_id INTEGER NOT NULL,
-              attachment_index INTEGER NOT NULL,
-              guild_id INTEGER NOT NULL,
+              channel_id INTEGER NOT NULL CHECK(channel_id > 0),
+              message_id INTEGER NOT NULL CHECK(message_id > 0),
+              attachment_index INTEGER NOT NULL CHECK(attachment_index >= 0),
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
               filename TEXT,
-              error_text TEXT NOT NULL,
-              first_failed_at INTEGER NOT NULL,
-              last_failed_at INTEGER NOT NULL,
-              attempt_count INTEGER NOT NULL,
+              error_text TEXT NOT NULL CHECK(length(error_text) > 0),
+              first_failed_at INTEGER NOT NULL CHECK(first_failed_at >= 0),
+              last_failed_at INTEGER NOT NULL CHECK(last_failed_at >= first_failed_at),
+              attempt_count INTEGER NOT NULL CHECK(attempt_count > 0),
               PRIMARY KEY(channel_id, message_id, attachment_index)
             );
             CREATE INDEX IF NOT EXISTS epub_version_filename_idx ON epub_version(original_filename);
@@ -316,6 +323,20 @@ class ArchiveDB:
 
         if added_cover_column:
             self._backfill_cover_image_flags_sync(conn)
+
+        self._check_integrity_sync(conn)
+
+    def _check_integrity_sync(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+
+        if row is None or row[0] != "ok":
+            detail = row[0] if row is not None else "no result"
+            raise RuntimeError(f"SQLite integrity check failed: {detail}")
+
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+        if foreign_key_errors:
+            raise RuntimeError("SQLite foreign key check failed")
 
     def _ensure_column_sync(
         self,
@@ -505,7 +526,7 @@ class ArchiveDB:
     def _reconstruct_epub_sync(self, conn: sqlite3.Connection, epub_version_id: int) -> bytes:
         rows = conn.execute(
             """
-            SELECT c.internal_path, b.compression, b.data
+            SELECT c.internal_path, c.size_uncompressed, b.compression, b.data
             FROM epub_component c
             JOIN blob b ON b.hash = c.blob_hash
             WHERE c.epub_version_id = ?
@@ -520,13 +541,18 @@ class ArchiveDB:
         with io.BytesIO() as out:
             with zipfile.ZipFile(out, "w") as zf:
                 for row in rows:
+                    internal_path = validate_internal_zip_path(row["internal_path"])
                     data = load_blob_payload(row["compression"], row["data"])
-                    if row["internal_path"] == "mimetype":
+
+                    if len(data) != row["size_uncompressed"]:
+                        raise ValueError("Archived EPUB component size mismatch")
+
+                    if internal_path == "mimetype":
                         info = zipfile.ZipInfo("mimetype")
                         info.compress_type = zipfile.ZIP_STORED
                         zf.writestr(info, data)
                     else:
-                        zf.writestr(row["internal_path"], data, compress_type=zipfile.ZIP_DEFLATED)
+                        zf.writestr(internal_path, data, compress_type=zipfile.ZIP_DEFLATED)
             return out.getvalue()
 
     async def import_epub_bytes(

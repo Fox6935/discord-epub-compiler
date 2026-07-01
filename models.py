@@ -48,7 +48,10 @@ def safe_log_text(value: object, limit: int = 180) -> str:
     clean = " ".join(clean.split())
 
     if len(clean) > limit:
-        return clean[: limit - 1] + "..."
+        if limit <= 3:
+            return clean[:limit]
+
+        return clean[: limit - 3] + "..."
 
     return clean
 
@@ -72,7 +75,7 @@ def _colorize(msg: str, level: str) -> str:
 
 def _clear_progress_line() -> None:
     if USE_PROGRESS:
-        sys.stdout.write("\r" + (" " * (_terminal_width() - 1)) + "\r")
+        sys.stdout.write("\r" + (" " * max(_terminal_width() - 4, 1)) + "\r")
         sys.stdout.flush()
 
 
@@ -80,9 +83,9 @@ def _write_progress_line(msg: str) -> None:
     if not USE_PROGRESS:
         return
 
-    width = _terminal_width()
-    clean = safe_log_text(msg, width - 1)
-    sys.stdout.write("\r" + clean.ljust(width - 1))
+    width = max(_terminal_width() - 4, 1)
+    clean = safe_log_text(msg, width)
+    sys.stdout.write("\r" + clean.ljust(width))
     sys.stdout.flush()
 
 
