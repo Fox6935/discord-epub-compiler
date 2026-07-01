@@ -13,6 +13,7 @@ from epub_tools import (
     disable_view_items, format_bytes, resolve_upload_limit_bytes, safe_default_output_name,
     sanitize_author, sanitize_output_name,
 )
+from filter import FilenameFilter
 from models import (
     COMPILE_SEMAPHORE, CompileSession, DEBUG_LOGS, OutputTooLargeError,
     is_session_live, log, log_success, log_warning,
@@ -33,10 +34,10 @@ def format_compact_estimate(size: int) -> str:
 
     unit = units[unit_index]
 
-    if unit == "B" or value >= 100:
-        return f"{round(value):.0f} {unit}"
+    if unit == "B" or value >= 10:
+        return f"{round(value):.0f}{unit}"
 
-    return f"{value:.1f} {unit}"
+    return f"{value:.1f}{unit}"
 
 
 class EpubPickerSelect(discord.ui.Select):
@@ -117,58 +118,6 @@ class EpubPickerSelect(discord.ui.Select):
                 session.selected_ids.update(self.values)
 
             new_view = CompileLayoutView(session)
-            new_view.message = view.message
-
-        await interaction.response.edit_message(view=new_view)
-
-
-class PrevPageButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self, disabled: bool):
-        super().__init__(
-            label="Prev",
-            style=discord.ButtonStyle.secondary,
-            disabled=disabled,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-
-        if view is None:
-            return
-
-        async with view.session.lock:
-            view.session.touch()
-
-            if view.session.current_page > 0:
-                view.session.current_page -= 1
-
-            new_view = CompileLayoutView(view.session)
-            new_view.message = view.message
-
-        await interaction.response.edit_message(view=new_view)
-
-
-class NextPageButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self, disabled: bool):
-        super().__init__(
-            label="Next",
-            style=discord.ButtonStyle.secondary,
-            disabled=disabled,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-
-        if view is None:
-            return
-
-        async with view.session.lock:
-            view.session.touch()
-
-            if view.session.current_page < view.session.page_count - 1:
-                view.session.current_page += 1
-
-            new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
         await interaction.response.edit_message(view=new_view)
@@ -294,15 +243,6 @@ class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
         await interaction.response.edit_message(view=new_view)
 
 
-class EstimateButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self, estimate_text: str):
-        super().__init__(
-            label=f"Estimate: {estimate_text}",
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-        )
-
-
 class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
     def __init__(self, disabled: bool):
         super().__init__(
@@ -354,10 +294,56 @@ class ClearPageButton(discord.ui.Button["CompileLayoutView"]):
         await interaction.response.edit_message(view=new_view)
 
 
-class OpenCompileModalButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self):
+class OpenSearchModalButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, active: bool):
         super().__init__(
-            label="Compile",
+            label="Edit Search" if active else "Search",
+            style=discord.ButtonStyle.secondary,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+
+        if view is None:
+            return
+
+        await interaction.response.send_modal(FilenameSearchModal(view.session))
+
+
+class ClearSearchButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, disabled: bool):
+        super().__init__(
+            label="Clear Search",
+            style=discord.ButtonStyle.secondary,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+
+        if view is None:
+            return
+
+        async with view.session.lock:
+            view.session.touch()
+            view.session.filename_filter = FilenameFilter()
+            view.session.current_page = 0
+
+            new_view = CompileLayoutView(view.session)
+            new_view.message = view.message
+
+        await interaction.response.edit_message(view=new_view)
+
+
+class OpenCompileModalButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, estimate_text: Optional[str]):
+        label = "Compile"
+
+        if estimate_text is not None:
+            label = f"Compile - {estimate_text}"
+
+        super().__init__(
+            label=label,
             style=discord.ButtonStyle.primary,
         )
 
@@ -420,7 +406,6 @@ class CompileLayoutView(discord.ui.LayoutView):
 
         self.add_item(discord.ui.TextDisplay(status_line))
 
-        next_disabled = session.current_page >= session.page_count - 1
         page_buttons = [
             PageJumpButton(page_index, session.current_page)
             for page_index in visible_page_indexes(
@@ -432,14 +417,13 @@ class CompileLayoutView(discord.ui.LayoutView):
         if len(page_buttons) > 1:
             self.add_item(discord.ui.ActionRow(*page_buttons))
 
-        self.add_item(
-            discord.ui.ActionRow(
-                FirstPageButton(disabled=session.current_page == 0),
-                PrevPageButton(disabled=session.current_page == 0),
-                NextPageButton(disabled=next_disabled),
-                LastPageButton(disabled=next_disabled),
+        if session.page_count > 5:
+            self.add_item(
+                discord.ui.ActionRow(
+                    FirstPageButton(disabled=session.current_page == 0),
+                    LastPageButton(disabled=session.current_page >= session.page_count - 1),
+                )
             )
-        )
 
         if session.flow_mode in {"compile", "delete"}:
             self.add_item(
@@ -449,6 +433,15 @@ class CompileLayoutView(discord.ui.LayoutView):
                         or page_selected_count == len(page_entries),
                     ),
                     ClearPageButton(disabled=page_selected_count == 0),
+                    OpenSearchModalButton(session.filename_filter.is_active),
+                    ClearSearchButton(disabled=not session.filename_filter.is_active),
+                )
+            )
+        else:
+            self.add_item(
+                discord.ui.ActionRow(
+                    OpenSearchModalButton(session.filename_filter.is_active),
+                    ClearSearchButton(disabled=not session.filename_filter.is_active),
                 )
             )
 
@@ -457,15 +450,15 @@ class CompileLayoutView(discord.ui.LayoutView):
             estimate_text = (
                 format_compact_estimate(estimated_size)
                 if estimated_size is not None
-                else "--"
+                else None
             )
-            self.add_item(
-                discord.ui.ActionRow(
-                    ToggleRemoveImagesButton(session.remove_all_images),
-                    EstimateButton(estimate_text),
-                )
-            )
-            self.add_item(discord.ui.ActionRow(OpenCompileModalButton()))
+            compile_controls = []
+
+            if session.selected_image_bytes() > 0:
+                compile_controls.append(ToggleRemoveImagesButton(session.remove_all_images))
+
+            compile_controls.append(OpenCompileModalButton(estimate_text))
+            self.add_item(discord.ui.ActionRow(*compile_controls))
         elif session.flow_mode == "delete":
             self.add_item(discord.ui.ActionRow(DeleteConfirmButton()))
         elif session.flow_mode == "reorder_move":
@@ -507,6 +500,59 @@ class CompileLayoutView(discord.ui.LayoutView):
         if self.message is not None:
             with contextlib.suppress(discord.NotFound, discord.HTTPException):
                 await self.message.edit(view=self)
+
+
+class FilenameSearchModal(discord.ui.Modal, title="Advanced Filename Search"):
+    help_text = discord.ui.TextDisplay(
+        "Search is case-insensitive. Use capitalized AND/OR as operators; "
+        "otherwise the whole input is matched as one phrase."
+    )
+    include = discord.ui.TextInput(
+        label="Includes",
+        placeholder="include EPUBs with...",
+        required=False,
+        max_length=200,
+    )
+    exclude = discord.ui.TextInput(
+        label="Excludes",
+        placeholder="exclude EPUBs with...",
+        required=False,
+        max_length=200,
+    )
+
+    def __init__(self, session: CompileSession):
+        super().__init__(timeout=300)
+
+        self.session = session
+        self.include.default = session.filename_filter.include
+        self.exclude.default = session.filename_filter.exclude
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message(
+                "This modal isn't yours.",
+                ephemeral=True,
+            )
+            return
+
+        if not is_session_live(self.session):
+            await interaction.response.send_message(
+                "This search session expired. Run `/compile` again.",
+                ephemeral=True,
+            )
+            return
+
+        async with self.session.lock:
+            self.session.touch()
+            self.session.filename_filter = FilenameFilter(
+                include=str(self.include or "").strip(),
+                exclude=str(self.exclude or "").strip(),
+            )
+            self.session.current_page = 0
+
+            new_view = CompileLayoutView(self.session)
+
+        await interaction.response.edit_message(view=new_view)
 
 
 class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
@@ -573,7 +619,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
         await interaction.response.send_message(
             (
                 f"Compiling {len(selected)} EPUB(s)...\n"
-                f"Remove all images: {'yes' if remove_all_images else 'no'}"
+                f"Remove images: {'yes' if remove_all_images else 'no'}"
                 f"{queue_hint}"
             ),
             ephemeral=True,
@@ -636,7 +682,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     "I couldn't send the compiled EPUB through Discord.\n"
                     f"Compiled size: {format_bytes(len(output_bytes))}\n"
                     f"Upload limit: {format_bytes(upload_limit)}\n"
-                    "Try selecting fewer EPUBs or enable `Remove all images`."
+                    "Try selecting fewer EPUBs or enable `Remove images`."
                 ),
                 ephemeral=True,
             )

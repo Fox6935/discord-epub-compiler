@@ -13,6 +13,7 @@ from config import (
     MAX_CONCURRENT_COMPILES,
     PAGE_SIZE,
 )
+from filter import FilenameFilter
 
 
 class OutputTooLargeError(ValueError):
@@ -193,6 +194,7 @@ class CompileSession:
     current_page: int = 0
     flow_mode: str = "compile"
     reorder_moving_id: Optional[str] = None
+    filename_filter: FilenameFilter = field(default_factory=FilenameFilter)
     remove_all_images: bool = False
     expired: bool = False
     created_at: datetime = field(default_factory=now_utc)
@@ -226,9 +228,19 @@ class CompileSession:
             if self.flow_mode == "reorder_place" and self.reorder_moving_id:
                 entries = [e for e in entries if e.entry_id != self.reorder_moving_id]
 
+            return self._apply_filename_filter(entries)
+
+        return self._apply_filename_filter(self.entries)
+
+    def _apply_filename_filter(self, entries: List[EpubEntry]) -> List[EpubEntry]:
+        if not self.filename_filter.is_active:
             return entries
 
-        return self.entries
+        return [
+            entry
+            for entry in entries
+            if self.filename_filter.matches(entry.filename)
+        ]
 
     def get_page_entries(self, page: int) -> List[EpubEntry]:
         entries = self.display_entries()
@@ -273,6 +285,15 @@ class CompileSession:
             + image_bytes
             + EPUB_SHELL_OVERHEAD_BYTES
         )
+
+    def selected_image_bytes(self) -> int:
+        image_sizes_by_hash: Dict[str, int] = {}
+
+        for entry in self.sort_selected_for_compile():
+            for blob_hash, blob_size in entry.image_blob_sizes:
+                image_sizes_by_hash.setdefault(blob_hash, blob_size)
+
+        return sum(image_sizes_by_hash.values())
 
     def page_range_label(self) -> str:
         if not self.display_entries():
