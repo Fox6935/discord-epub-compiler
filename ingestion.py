@@ -2,6 +2,7 @@ import asyncio
 import random
 import sqlite3
 import traceback
+from datetime import timedelta, timezone
 from typing import Any, Dict, Optional, Set
 
 import aiohttp
@@ -9,20 +10,29 @@ import discord
 
 from config import (
     CATEGORY_RECONCILE_SECONDS, GUILD_ID, HISTORY_BATCH_SIZE, HTTP_TIMEOUT_SECONDS,
-    MAX_SOURCE_EPUB_BYTES, get_configured_guild, is_configured_guild,
+    LIVE_IMPORT_DELAY_SECONDS, LIVE_IMPORT_RATE_SECONDS, MAX_SOURCE_EPUB_BYTES,
+    get_configured_guild, is_configured_guild,
 )
 from db import (
-    ARCHIVE, get_watched_channel_row, normalize_channel_effective_order,
-    unix_now, update_channel_cursor, watched_categories, watched_channels,
+    ARCHIVE, advance_channel_last_processed_message, get_watched_channel_row,
+    normalize_channel_effective_order, unix_now, update_channel_cursor,
+    watched_categories, watched_channels,
 )
 from epub_tools import is_epub_attachment
-from models import DEBUG_LOGS, SESSIONS, ScanProgress, log_success, log_warning, now_utc
+from models import (
+    DEBUG_LOGS, SESSIONS, ScanProgress, log_success, log_warning, now_utc,
+    safe_log_text,
+)
 from config import MAX_SESSION_LIFETIME_SECONDS, SESSION_TIMEOUT_SECONDS
 
 SCAN_QUEUE: asyncio.Queue[discord.TextChannel] = asyncio.Queue()
 QUEUED_SCAN_CHANNEL_IDS: Set[int] = set()
 ACTIVE_SCAN_CHANNEL_IDS: Set[int] = set()
 SCAN_WORKER_STARTED = False
+LIVE_IMPORT_QUEUE: asyncio.Queue[tuple[discord.Message, int]] = asyncio.Queue()
+QUEUED_LIVE_IMPORT_KEYS: Set[tuple[int, int, int]] = set()
+LIVE_IMPORT_PENDING_BY_MESSAGE: Dict[tuple[int, int], int] = {}
+LIVE_IMPORT_WORKER_STARTED = False
 
 
 def is_eligible_watch_channel(channel: Any) -> bool:
@@ -168,7 +178,8 @@ async def import_message_epubs(
                             scan_progress.archived_epubs += 1
                             scan_progress.update(att.filename)
                         else:
-                            log_success(f"Archived {att.filename} from #{getattr(message.channel, 'name', message.channel.id)}")
+                            channel_name = safe_log_text(getattr(message.channel, "name", message.channel.id), 80)
+                            log_success(f"Archived {safe_log_text(att.filename)} from #{channel_name}")
                     last_error = None
                     break
                 except Exception as exc:
@@ -177,7 +188,10 @@ async def import_message_epubs(
                         await asyncio.sleep(0.75 * (2**attempt) + random.uniform(0, 0.25))
 
             if last_error is not None:
-                log_warning(f"Import failed for {att.filename} in message {message.id}: {last_error}")
+                log_warning(
+                    f"Import failed for {safe_log_text(att.filename)} "
+                    f"in message {message.id}: {safe_log_text(last_error)}"
+                )
                 await ARCHIVE.record_import_failure(
                     guild_id=GUILD_ID,
                     channel_id=message.channel.id,
@@ -188,6 +202,79 @@ async def import_message_epubs(
                 )
 
     return imported_count
+
+
+def enqueue_live_message_epubs(message: discord.Message) -> int:
+    ensure_live_import_worker_started()
+    queued = 0
+    message_key = (message.channel.id, message.id)
+
+    for idx, att in enumerate(message.attachments):
+        if not is_epub_attachment(att):
+            continue
+
+        key = (message.channel.id, message.id, idx)
+
+        if key in QUEUED_LIVE_IMPORT_KEYS:
+            continue
+
+        QUEUED_LIVE_IMPORT_KEYS.add(key)
+        LIVE_IMPORT_PENDING_BY_MESSAGE[message_key] = (
+            LIVE_IMPORT_PENDING_BY_MESSAGE.get(message_key, 0) + 1
+        )
+        LIVE_IMPORT_QUEUE.put_nowait((message, idx))
+        queued += 1
+
+    return queued
+
+
+async def live_import_worker() -> None:
+    while True:
+        message, attachment_index = await LIVE_IMPORT_QUEUE.get()
+        key = (message.channel.id, message.id, attachment_index)
+        message_key = (message.channel.id, message.id)
+
+        try:
+            created_at = message.created_at
+
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            available_at = created_at + timedelta(seconds=LIVE_IMPORT_DELAY_SECONDS)
+            wait_seconds = max(0.0, (available_at - now_utc()).total_seconds())
+
+            if wait_seconds:
+                await asyncio.sleep(wait_seconds)
+
+            row = await get_watched_channel_row(message.channel.id)
+            if row is None:
+                continue
+
+            try:
+                fresh_message = await message.channel.fetch_message(message.id)
+            except discord.NotFound:
+                continue
+
+            await import_message_epubs(
+                fresh_message,
+                only_attachment_indexes={attachment_index},
+            )
+        except Exception as exc:
+            log_warning(f"Queued live import failed for message {message.id}: {safe_log_text(exc)}")
+            if DEBUG_LOGS:
+                traceback.print_exc()
+        finally:
+            QUEUED_LIVE_IMPORT_KEYS.discard(key)
+            remaining = LIVE_IMPORT_PENDING_BY_MESSAGE.get(message_key, 0) - 1
+
+            if remaining <= 0:
+                LIVE_IMPORT_PENDING_BY_MESSAGE.pop(message_key, None)
+                await advance_channel_last_processed_message(message.channel.id, message.id)
+            else:
+                LIVE_IMPORT_PENDING_BY_MESSAGE[message_key] = remaining
+
+            LIVE_IMPORT_QUEUE.task_done()
+            await asyncio.sleep(LIVE_IMPORT_RATE_SECONDS)
 
 
 async def start_historical_scan(channel: discord.TextChannel) -> None:
@@ -326,6 +413,16 @@ def ensure_scan_worker_started() -> None:
 
     SCAN_WORKER_STARTED = True
     asyncio.create_task(historical_scan_worker())
+
+
+def ensure_live_import_worker_started() -> None:
+    global LIVE_IMPORT_WORKER_STARTED
+
+    if LIVE_IMPORT_WORKER_STARTED:
+        return
+
+    LIVE_IMPORT_WORKER_STARTED = True
+    asyncio.create_task(live_import_worker())
 
 
 async def catch_up_channel(channel: discord.TextChannel) -> None:

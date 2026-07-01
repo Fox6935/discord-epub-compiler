@@ -8,11 +8,12 @@ from config import (
     GUILD_ID, TOKEN, bot, get_configured_guild, has_compile_action_permission,
     is_admin, is_configured_guild,
 )
-from db import ARCHIVE, get_watched_channel_row, update_channel_cursor
+from db import ARCHIVE, get_watched_channel_row
+from epub_tools import is_epub_attachment
 from ingestion import (
     category_reconcile_loop, cleanup_sessions, enqueue_historical_scan,
-    ensure_scan_worker_started, import_message_epubs, reconcile_watched_category,
-    retry_channel_import_failures,
+    ensure_live_import_worker_started, ensure_scan_worker_started,
+    enqueue_live_message_epubs, reconcile_watched_category, retry_channel_import_failures,
     startup_channel_work, upsert_watched_category, upsert_watched_channel,
 )
 from models import CompileSession, SESSIONS, build_session_key, log, log_success, log_warning
@@ -241,11 +242,10 @@ async def on_message(message: discord.Message) -> None:
     if row is None:
         return
 
-    await import_message_epubs(message)
-    await update_channel_cursor(
-        message.channel.id,
-        last_processed_message_id=max(message.id, row["last_processed_message_id"] or 0),
-    )
+    if not any(is_epub_attachment(att) for att in message.attachments):
+        return
+
+    enqueue_live_message_epubs(message)
 
 
 @bot.event
@@ -277,6 +277,7 @@ async def on_ready() -> None:
         bot._cleanup_started = True
         asyncio.create_task(cleanup_sessions())
         ensure_scan_worker_started()
+        ensure_live_import_worker_started()
         log("Cleanup task started")
 
     if guild is not None and not getattr(bot, "_guild_work_started", False):

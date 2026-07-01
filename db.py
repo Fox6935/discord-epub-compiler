@@ -812,6 +812,23 @@ async def update_channel_cursor(channel_id: int, **fields: Any) -> None:
     )
 
 
+async def advance_channel_last_processed_message(channel_id: int, message_id: int) -> None:
+    await ARCHIVE.run(
+        lambda conn: conn.execute(
+            """
+            UPDATE watched_channel
+            SET last_processed_message_id = CASE
+              WHEN last_processed_message_id IS NULL OR last_processed_message_id < ?
+              THEN ?
+              ELSE last_processed_message_id
+            END
+            WHERE channel_id = ?
+            """,
+            (message_id, message_id, channel_id),
+        )
+    )
+
+
 async def normalize_channel_effective_order(channel_id: int) -> None:
     def sync(conn: sqlite3.Connection) -> None:
         rows = conn.execute(

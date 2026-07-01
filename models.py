@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -39,6 +40,17 @@ logging.basicConfig(
 )
 
 _ACTIVE_PROGRESS: Optional["ScanProgress"] = None
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def safe_log_text(value: object, limit: int = 180) -> str:
+    clean = CONTROL_CHAR_RE.sub(" ", str(value))
+    clean = " ".join(clean.split())
+
+    if len(clean) > limit:
+        return clean[: limit - 1] + "..."
+
+    return clean
 
 
 def _terminal_width() -> int:
@@ -69,14 +81,14 @@ def _write_progress_line(msg: str) -> None:
         return
 
     width = _terminal_width()
-    clean = msg[: width - 1]
+    clean = safe_log_text(msg, width - 1)
     sys.stdout.write("\r" + clean.ljust(width - 1))
     sys.stdout.flush()
 
 
 def _write_log(msg: str, level: str = "info") -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {_colorize(msg, level)}", flush=True)
+    print(f"[{timestamp}] {_colorize(safe_log_text(msg, 2000), level)}", flush=True)
 
 
 def log(msg: str, level: str = "info") -> None:
@@ -101,7 +113,7 @@ def log_warning(msg: str) -> None:
 
 class ScanProgress:
     def __init__(self, channel_name: str):
-        self.channel_name = channel_name
+        self.channel_name = safe_log_text(channel_name, 80)
         self.scanned_messages = 0
         self.archived_epubs = 0
         self.started = False
@@ -116,7 +128,7 @@ class ScanProgress:
 
     def update(self, current_filename: Optional[str] = None) -> None:
         if current_filename:
-            self.current_filename = current_filename
+            self.current_filename = safe_log_text(current_filename)
         self.render()
 
     def render(self) -> None:

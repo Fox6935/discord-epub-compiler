@@ -16,7 +16,7 @@ from epub_tools import (
 from filter import FilenameFilter
 from models import (
     COMPILE_SEMAPHORE, CompileSession, DEBUG_LOGS, OutputTooLargeError,
-    is_session_live, log, log_success, log_warning,
+    is_session_live, log, log_success, log_warning, safe_log_text,
 )
 
 
@@ -52,10 +52,11 @@ class EpubPickerSelect(discord.ui.Select):
 
         for entry in page_entries:
             created = entry.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            safe_filename = safe_log_text(entry.filename, 100)
             if session.flow_mode == "delete" and entry.is_deleted:
-                label = f"{WARNING_MARK}{entry.filename}{WARNING_MARK}"
+                label = f"{WARNING_MARK}{safe_filename}{WARNING_MARK}"
             else:
-                label = entry.filename
+                label = safe_filename
             label = label[:100]
             size = format_bytes(entry.attachment_size or 0)
             description = f"{created} - {size}"
@@ -608,16 +609,23 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     max_output_bytes=upload_limit,
                 )
         except OutputTooLargeError as exc:
-            log_warning(f"Compile too large for {interaction.user}: {exc}")
-            await interaction.followup.send(str(exc), ephemeral=True)
+            safe_error = safe_log_text(exc, 1900)
+            log_warning(f"Compile too large for {interaction.user}: {safe_error}")
+            await interaction.followup.send(
+                safe_error,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         except Exception as exc:
-            log_warning(f"Compile failed for {interaction.user}: {exc}")
+            safe_error = safe_log_text(exc, 1500)
+            log_warning(f"Compile failed for {interaction.user}: {safe_error}")
             if DEBUG_LOGS:
                 traceback.print_exc()
             await interaction.followup.send(
-                f"Compile failed: {exc}",
+                f"Compile failed: {safe_error}",
                 ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
@@ -629,7 +637,11 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             if detail:
                 msg += f"\n{detail}"
 
-            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(
+                msg[:1900],
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
         message_lines = [f"Here is your compiled EPUB: {output_name}.epub"]
@@ -647,6 +659,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     filename=f"{output_name}.epub",
                 ),
                 ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException as exc:
             log_warning(f"Couldn't send compiled EPUB to {interaction.user}: {exc}")
@@ -658,6 +671,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     "Try selecting fewer EPUBs or enable `Remove images`."
                 ),
                 ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 

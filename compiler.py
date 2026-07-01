@@ -9,7 +9,7 @@ from epub_tools import (
     build_compiled_epub_bytes, estimate_compiled_epub_bytes, extract_book_content,
     format_bytes,
 )
-from models import EpubEntry, OutputTooLargeError, DEBUG_LOGS, log_warning
+from models import EpubEntry, OutputTooLargeError, DEBUG_LOGS, log_warning, safe_log_text
 
 
 async def compile_selected_epubs(
@@ -28,6 +28,8 @@ async def compile_selected_epubs(
     skipped: List[Tuple[str, str]] = []
 
     for entry_index, entry in enumerate(selected, start=1):
+        safe_filename = safe_log_text(entry.filename)
+
         try:
             epub_bytes = await ARCHIVE.reconstruct_epub(entry.epub_version_id)
             chapters, images = await asyncio.to_thread(
@@ -40,8 +42,8 @@ async def compile_selected_epubs(
             )
 
             if not chapters:
-                skipped.append((entry.filename, "No usable chapter files found"))
-                log_warning(f"Skipped {entry.filename}: No usable chapter files found")
+                skipped.append((safe_filename, "No usable chapter files found"))
+                log_warning(f"Skipped {safe_filename}: No usable chapter files found")
                 continue
 
             final_chapters.extend(chapters)
@@ -57,7 +59,7 @@ async def compile_selected_epubs(
                         "Images alone are near or above the Discord upload limit.\n"
                         f"Image payload: {format_bytes(image_payload_size)}\n"
                         f"Limit: {format_bytes(max_output_bytes)}\n"
-                        "Try again with `Remove all images` enabled."
+                        "Try again with `Remove images` enabled."
                     )
 
             estimated_size = estimate_compiled_epub_bytes(
@@ -70,23 +72,25 @@ async def compile_selected_epubs(
                 raise OutputTooLargeError(
                     "Compilation aborted before reconstructing remaining EPUBs.\n"
                     f"Estimated output size after EPUB "
-                    f"{entry_index}/{len(selected)}: {entry.filename}\n"
+                    f"{entry_index}/{len(selected)}: {safe_filename}\n"
                     f"Estimated size: {format_bytes(estimated_size)}\n"
                     f"Limit: {format_bytes(max_output_bytes)}\n"
-                    "Try selecting fewer EPUBs or enable `Remove all images`."
+                    "Try selecting fewer EPUBs or enable `Remove images`."
                 )
 
         except OutputTooLargeError:
             raise
         except zipfile.BadZipFile:
-            skipped.append((entry.filename, "Invalid archived EPUB/ZIP"))
-            log_warning(f"Skipped {entry.filename}: Invalid archived EPUB/ZIP")
+            skipped.append((safe_filename, "Invalid archived EPUB/ZIP"))
+            log_warning(f"Skipped {safe_filename}: Invalid archived EPUB/ZIP")
         except KeyError as exc:
-            skipped.append((entry.filename, f"Missing file: {exc}"))
-            log_warning(f"Skipped {entry.filename}: Missing file: {exc}")
+            safe_error = safe_log_text(exc)
+            skipped.append((safe_filename, f"Missing file: {safe_error}"))
+            log_warning(f"Skipped {safe_filename}: Missing file: {safe_error}")
         except Exception as exc:
-            skipped.append((entry.filename, str(exc)[:200]))
-            log_warning(f"Skipped {entry.filename}: {exc}")
+            safe_error = safe_log_text(exc, 200)
+            skipped.append((safe_filename, safe_error))
+            log_warning(f"Skipped {safe_filename}: {safe_error}")
             if DEBUG_LOGS:
                 traceback.print_exc()
 
@@ -107,7 +111,7 @@ async def compile_selected_epubs(
             "The compiled EPUB is too large to send through Discord.\n"
             f"Compiled size: {format_bytes(len(output))}\n"
             f"Limit: {format_bytes(max_output_bytes)}\n"
-            "Try selecting fewer EPUBs or enable `Remove all images`."
+            "Try selecting fewer EPUBs or enable `Remove images`."
         )
 
     return output, skipped

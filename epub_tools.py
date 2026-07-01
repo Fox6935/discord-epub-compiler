@@ -16,7 +16,7 @@ from defusedxml.common import DefusedXmlException
 from config import (
     ALLOWED_NAME_RE, CHAPTER_ZIP_COMPRESSION_RATIO, CONTAINER_NS,
     DEFAULT_UPLOAD_LIMIT_BYTES, EPUB_EXT_RE, EPUB_NS, EPUB_SHELL_OVERHEAD_BYTES,
-    MAX_SINGLE_FILE_UNCOMPRESSED_BYTES, MAX_SOURCE_UNCOMPRESSED_BYTES,
+    MAX_SINGLE_FILE_UNCOMPRESSED_BYTES, MAX_SOURCE_UNCOMPRESSED_BYTES, MAX_ZIP_MEMBERS,
     SAFE_FILE_RE, SAFE_META_RE, SVG_NS, XLINK_NS, XHTML_NS, XML_NS,
 )
 
@@ -48,6 +48,32 @@ TEXT_TAGS = {
     "th",
 }
 IMAGE_TAGS = {"img", "image", "svg"}
+SAFE_URL_SCHEMES = {"", "http", "https", "mailto"}
+URL_ATTRS = {
+    "href",
+    "src",
+    "poster",
+    "longdesc",
+    "cite",
+    "action",
+    "formaction",
+    "background",
+}
+RESOURCE_URL_ATTRS = {
+    "src",
+    "poster",
+    "longdesc",
+    "background",
+}
+RESOURCE_URL_TAGS = {
+    "img",
+    "image",
+}
+DROP_ATTRS = {
+    "srcset",
+    "style",
+    "formaction",
+}
 
 
 def local_name(tag: str) -> str:
@@ -253,7 +279,12 @@ def safe_zip_read(zf: zipfile.ZipFile, name: str) -> bytes:
 
 
 def validate_zip_member_names(zf: zipfile.ZipFile) -> None:
-    for info in zf.infolist():
+    members = zf.infolist()
+
+    if len(members) > MAX_ZIP_MEMBERS:
+        raise ValueError("EPUB has too many files")
+
+    for info in members:
         name = info.filename.replace("\\", "/")
 
         if "\x00" in name:
@@ -270,8 +301,12 @@ def validate_zip_member_names(zf: zipfile.ZipFile) -> None:
 
 def validate_zip_sizes(zf: zipfile.ZipFile) -> None:
     total = 0
+    members = zf.infolist()
 
-    for info in zf.infolist():
+    if len(members) > MAX_ZIP_MEMBERS:
+        raise ValueError("EPUB has too many files")
+
+    for info in members:
         if info.file_size > MAX_SINGLE_FILE_UNCOMPRESSED_BYTES:
             raise ValueError(f"EPUB member too large: {info.filename}")
 
@@ -619,25 +654,67 @@ def strip_dangerous_elements(root: ET.Element) -> None:
         "iframe",
         "object",
         "embed",
+        "foreignObject",
+        "audio",
+        "video",
+        "source",
+        "track",
+        "form",
+        "input",
+        "button",
+        "select",
+        "textarea",
+        "meta",
+        "base",
     }
 
-    for parent in root.iter():
-        for child in list(parent):
-            if local_name(child.tag) in dangerous:
-                parent.remove(child)
+    changed = True
+
+    while changed:
+        changed = False
+
+        for parent in root.iter():
+            for child in list(parent):
+                if local_name(child.tag) in dangerous:
+                    parent.remove(child)
+                    changed = True
+
+
+def is_safe_url_value(tag_name: str, attr_name: str, value: str) -> bool:
+    raw = (value or "").strip()
+
+    if not raw:
+        return True
+
+    if raw.startswith("#"):
+        return True
+
+    parsed = raw.split(":", 1)
+
+    if len(parsed) == 1:
+        return True
+
+    scheme = parsed[0].strip().lower()
+
+    if attr_name in RESOURCE_URL_ATTRS or tag_name in RESOURCE_URL_TAGS:
+        return False
+
+    return scheme in SAFE_URL_SCHEMES
 
 
 def strip_dangerous_attributes(root: ET.Element) -> None:
     for elem in root.iter():
+        tag_lname = local_name(elem.tag)
+
         for attr in list(elem.attrib):
             attr_lname = local_name(attr).lower()
-            value = (elem.get(attr) or "").strip().lower()
+            value = elem.get(attr) or ""
 
-            if attr_lname.startswith("on"):
+            if attr_lname.startswith("on") or attr_lname in DROP_ATTRS:
                 elem.attrib.pop(attr, None)
                 continue
 
-            if attr_lname in {"href", "src"} and value.startswith("javascript:"):
+            if attr_lname in URL_ATTRS and not is_safe_url_value(tag_lname, attr_lname, value):
                 elem.attrib.pop(attr, None)
                 continue
 
