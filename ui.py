@@ -310,31 +310,6 @@ class OpenSearchModalButton(discord.ui.Button["CompileLayoutView"]):
         await interaction.response.send_modal(FilenameSearchModal(view.session))
 
 
-class ClearSearchButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self, disabled: bool):
-        super().__init__(
-            label="Clear Search",
-            style=discord.ButtonStyle.secondary,
-            disabled=disabled,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-
-        if view is None:
-            return
-
-        async with view.session.lock:
-            view.session.touch()
-            view.session.filename_filter = FilenameFilter()
-            view.session.current_page = 0
-
-            new_view = CompileLayoutView(view.session)
-            new_view.message = view.message
-
-        await interaction.response.edit_message(view=new_view)
-
-
 class OpenCompileModalButton(discord.ui.Button["CompileLayoutView"]):
     def __init__(self, estimate_text: Optional[str]):
         label = "Compile"
@@ -396,7 +371,6 @@ class CompileLayoutView(discord.ui.LayoutView):
 
         stats = discord.ui.Container(
             discord.ui.TextDisplay(title),
-            discord.ui.TextDisplay(f"Select EPUBs from <#{session.channel_id}>"),
             accent_colour=discord.Colour.blurple(),
         )
         self.add_item(stats)
@@ -434,14 +408,12 @@ class CompileLayoutView(discord.ui.LayoutView):
                     ),
                     ClearPageButton(disabled=page_selected_count == 0),
                     OpenSearchModalButton(session.filename_filter.is_active),
-                    ClearSearchButton(disabled=not session.filename_filter.is_active),
                 )
             )
         else:
             self.add_item(
                 discord.ui.ActionRow(
                     OpenSearchModalButton(session.filename_filter.is_active),
-                    ClearSearchButton(disabled=not session.filename_filter.is_active),
                 )
             )
 
@@ -505,7 +477,8 @@ class CompileLayoutView(discord.ui.LayoutView):
 class FilenameSearchModal(discord.ui.Modal, title="Advanced Filename Search"):
     help_text = discord.ui.TextDisplay(
         "Search is case-insensitive. Use capitalized AND/OR as operators; "
-        "otherwise the whole input is matched as one phrase."
+        "otherwise the whole input is matched as one phrase. "
+        "Submit both fields blank to clear the filter."
     )
     include = discord.ui.TextInput(
         label="Includes",
