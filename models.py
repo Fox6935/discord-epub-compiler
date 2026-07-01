@@ -274,14 +274,6 @@ class CompileSession:
             + EPUB_SHELL_OVERHEAD_BYTES
         )
 
-    def all_selected_on_page(self) -> bool:
-        page_entries = self.current_page_entries()
-        selected = self.placement_ids if self.flow_mode == "reorder_place" else self.selected_ids
-
-        return bool(page_entries) and all(
-            entry.entry_id in selected for entry in page_entries
-        )
-
     def page_range_label(self) -> str:
         if not self.display_entries():
             return "00-00"

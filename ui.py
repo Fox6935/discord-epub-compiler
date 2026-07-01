@@ -22,6 +22,23 @@ from models import (
 WARNING_MARK = "\u26a0\ufe0f"
 
 
+def format_compact_estimate(size: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    unit_index = 0
+
+    while value >= 999.5 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+
+    unit = units[unit_index]
+
+    if unit == "B" or value >= 100:
+        return f"{round(value):.0f} {unit}"
+
+    return f"{value:.1f} {unit}"
+
+
 class EpubPickerSelect(discord.ui.Select):
     def __init__(self, session: CompileSession):
         page_entries = session.current_page_entries()
@@ -257,7 +274,7 @@ class PageJumpButton(discord.ui.Button["CompileLayoutView"]):
 class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
     def __init__(self, enabled: bool):
         super().__init__(
-            label="Remove images: yes" if enabled else "Remove images: no",
+            label="\u2611 Remove images" if enabled else "\u2610 Remove images",
             style=discord.ButtonStyle.secondary,
         )
 
@@ -277,10 +294,19 @@ class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
         await interaction.response.edit_message(view=new_view)
 
 
-class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
-    def __init__(self, all_selected: bool, disabled: bool):
+class EstimateButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, estimate_text: str):
         super().__init__(
-            label="Deselect Page" if all_selected else "Select Page",
+            label=f"Estimate: {estimate_text}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+
+
+class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
+    def __init__(self, disabled: bool):
+        super().__init__(
+            label="Select Page",
             style=discord.ButtonStyle.secondary,
             disabled=disabled,
         )
@@ -295,11 +321,7 @@ class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
             view.session.touch()
             page_entries = view.session.current_page_entries()
             page_ids = {e.entry_id for e in page_entries}
-
-            if all(e.entry_id in view.session.selected_ids for e in page_entries):
-                view.session.selected_ids.difference_update(page_ids)
-            else:
-                view.session.selected_ids.update(page_ids)
+            view.session.selected_ids.update(page_ids)
 
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
@@ -366,6 +388,9 @@ class CompileLayoutView(discord.ui.LayoutView):
         self.message: Optional[discord.Message] = None
 
         page_entries = session.current_page_entries()
+        page_selected_count = sum(
+            1 for entry in page_entries if entry.entry_id in session.selected_ids
+        )
         display_total = len(session.display_entries())
         title = {
             "compile": "# EPUB Compiler",
@@ -378,36 +403,22 @@ class CompileLayoutView(discord.ui.LayoutView):
             if session.flow_mode == "reorder_place"
             else len(session.selected_ids)
         )
-        stats_lines = [
-            f"**EPUBs**: {display_total}",
-            f"**Selected**: {selected_count}",
-            f"**Page**: {session.current_page + 1}/{session.page_count}",
-        ]
-
-        if session.flow_mode == "compile":
-            estimated_size = session.estimated_output_bytes()
-
-            if estimated_size is not None:
-                stats_lines.append(
-                    f"**Estimated output**: {format_bytes(estimated_size)}"
-                )
+        status_line = (
+            f"**Selected:** {selected_count}/{display_total} | "
+            f"**Page:** {session.current_page + 1}/{session.page_count}"
+        )
 
         stats = discord.ui.Container(
             discord.ui.TextDisplay(title),
             discord.ui.TextDisplay(f"Select EPUBs from <#{session.channel_id}>"),
-            discord.ui.Separator(),
-            discord.ui.TextDisplay("\n".join(stats_lines)),
             accent_colour=discord.Colour.blurple(),
         )
         self.add_item(stats)
 
-        if session.flow_mode == "compile":
-            self.add_item(
-                discord.ui.ActionRow(ToggleRemoveImagesButton(session.remove_all_images))
-            )
-
         if page_entries:
             self.add_item(discord.ui.ActionRow(EpubPickerSelect(session)))
+
+        self.add_item(discord.ui.TextDisplay(status_line))
 
         next_disabled = session.current_page >= session.page_count - 1
         page_buttons = [
@@ -434,14 +445,26 @@ class CompileLayoutView(discord.ui.LayoutView):
             self.add_item(
                 discord.ui.ActionRow(
                     SelectPageButton(
-                        session.all_selected_on_page(),
-                        disabled=not bool(page_entries),
+                        disabled=not bool(page_entries)
+                        or page_selected_count == len(page_entries),
                     ),
-                    ClearPageButton(disabled=not bool(page_entries)),
+                    ClearPageButton(disabled=page_selected_count == 0),
                 )
             )
 
         if session.flow_mode == "compile":
+            estimated_size = session.estimated_output_bytes()
+            estimate_text = (
+                format_compact_estimate(estimated_size)
+                if estimated_size is not None
+                else "--"
+            )
+            self.add_item(
+                discord.ui.ActionRow(
+                    ToggleRemoveImagesButton(session.remove_all_images),
+                    EstimateButton(estimate_text),
+                )
+            )
             self.add_item(discord.ui.ActionRow(OpenCompileModalButton()))
         elif session.flow_mode == "delete":
             self.add_item(discord.ui.ActionRow(DeleteConfirmButton()))
