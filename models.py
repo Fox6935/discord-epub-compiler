@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from config import (
-    CHAPTER_ZIP_COMPRESSION_RATIO,
     EPUB_SHELL_OVERHEAD_BYTES,
     MAX_CONCURRENT_COMPILES,
     PAGE_SIZE,
@@ -296,7 +295,7 @@ class CompileSession:
             image_bytes = sum(image_sizes_by_hash.values())
 
         return (
-            int(chapter_bytes * CHAPTER_ZIP_COMPRESSION_RATIO)
+            chapter_bytes
             + image_bytes
             + EPUB_SHELL_OVERHEAD_BYTES
         )

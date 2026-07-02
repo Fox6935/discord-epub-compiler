@@ -450,7 +450,7 @@ class ArchiveDB:
                   CASE
                     WHEN c.spine_order IS NOT NULL
                      AND c.media_type IN ('application/xhtml+xml', 'text/html', 'application/xml')
-                    THEN c.size_uncompressed
+                    THEN b.size_stored
                     ELSE 0
                   END
                 ),
@@ -458,6 +458,7 @@ class ArchiveDB:
               ) AS estimated_chapter_bytes
             FROM discord_epub d
             LEFT JOIN epub_component c ON c.epub_version_id = d.epub_version_id
+            LEFT JOIN blob b ON b.hash = c.blob_hash
             WHERE d.guild_id = ? AND d.channel_id = ? {deleted_filter}
             GROUP BY d.id
             ORDER BY d.effective_order DESC
