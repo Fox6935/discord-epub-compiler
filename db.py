@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import io
 import os
@@ -177,8 +178,9 @@ class ArchiveDB:
             return await asyncio.to_thread(self._run_sync, func, *args)
 
     def _run_sync(self, func, *args):
-        with self.connect() as conn:
-            return func(conn, *args)
+        with contextlib.closing(self.connect()) as conn:
+            with conn:
+                return func(conn, *args)
 
     async def bootstrap(self) -> None:
         new_db = not os.path.exists(self.path)
