@@ -183,6 +183,11 @@ class ArchiveDB:
                 return func(conn, *args)
 
     async def bootstrap(self) -> None:
+        db_dir = os.path.dirname(os.path.abspath(self.path))
+
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
         new_db = not os.path.exists(self.path)
         await self.run(self._bootstrap_sync, new_db)
 

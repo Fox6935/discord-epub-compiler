@@ -9,7 +9,8 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID") or os.getenv("GUILD_ID") or "0")
-DB_PATH = os.getenv("EPUB_ARCHIVE_DB", "epub_archive.sqlite3")
+DEFAULT_DB_PATH = "/compileSQL/epub_archive.sqlite3"
+DB_PATH = (os.getenv("EPUB_ARCHIVE_DB") or DEFAULT_DB_PATH).strip()
 SPECIAL_ROLE_ID = int(os.getenv("SPECIAL_ROLE_ID", "0") or "0")
 EXTERNAL_UPLOAD_URL = (os.getenv("api_url") or os.getenv("API_URL") or "").strip()
 EXTERNAL_UPLOAD_KEY = (os.getenv("api_key") or os.getenv("API_KEY") or "").strip()
