@@ -3,7 +3,9 @@ import io
 import mimetypes
 import posixpath
 import re
+import urllib.parse
 import uuid
+import zlib
 import zipfile
 from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
@@ -14,10 +16,11 @@ from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
 from config import (
-    ALLOWED_NAME_RE, CHAPTER_ZIP_COMPRESSION_RATIO, CONTAINER_NS,
-    DEFAULT_UPLOAD_LIMIT_BYTES, EPUB_EXT_RE, EPUB_NS, EPUB_SHELL_OVERHEAD_BYTES,
-    MAX_SINGLE_FILE_UNCOMPRESSED_BYTES, MAX_SOURCE_UNCOMPRESSED_BYTES, MAX_ZIP_MEMBERS,
-    SAFE_FILE_RE, SAFE_META_RE, SVG_NS, XLINK_NS, XHTML_NS, XML_NS,
+    ALLOWED_NAME_RE, CONTAINER_NS, DEFAULT_UPLOAD_LIMIT_BYTES,
+    EPUB_BASE_OVERHEAD_BYTES, EPUB_EXT_RE, EPUB_NS, EPUB_PER_CHAPTER_OVERHEAD_BYTES,
+    EPUB_PER_IMAGE_OVERHEAD_BYTES, MAX_SINGLE_FILE_UNCOMPRESSED_BYTES,
+    MAX_SOURCE_UNCOMPRESSED_BYTES, MAX_ZIP_MEMBERS, SAFE_FILE_RE, SAFE_META_RE,
+    SVG_NS, XLINK_NS, XHTML_NS, XML_NS,
 )
 
 ET.register_namespace("", XHTML_NS)
@@ -164,6 +167,7 @@ def make_unique_name(name: str, used: Set[str]) -> str:
 
 def resolve_href(base_path: str, href: str) -> str:
     clean = href.split("#", 1)[0].strip()
+    clean = urllib.parse.unquote(clean)
 
     if not clean:
         raise ValueError("Empty href")
@@ -231,15 +235,26 @@ def estimate_compiled_epub_bytes(
     final_images: Dict[str, bytes],
     remove_all_images: bool,
 ) -> int:
-    chapter_bytes = sum(len(blob) for _, _, blob in final_chapters)
-    chapter_part = int(chapter_bytes * CHAPTER_ZIP_COMPRESSION_RATIO)
+    chapter_part = sum(raw_deflate_size(blob) for _, _, blob in final_chapters)
     image_part = (
         0
         if remove_all_images
-        else sum(len(data) for data in final_images.values())
+        else sum(raw_deflate_size(data) for data in final_images.values())
+    )
+    image_count = 0 if remove_all_images else len(final_images)
+
+    return (
+        chapter_part
+        + image_part
+        + EPUB_BASE_OVERHEAD_BYTES
+        + (len(final_chapters) * EPUB_PER_CHAPTER_OVERHEAD_BYTES)
+        + (image_count * EPUB_PER_IMAGE_OVERHEAD_BYTES)
     )
 
-    return chapter_part + image_part + EPUB_SHELL_OVERHEAD_BYTES
+
+def raw_deflate_size(data: bytes) -> int:
+    compressor = zlib.compressobj(level=6, wbits=-15)
+    return len(compressor.compress(data) + compressor.flush())
 
 
 def format_bytes(size: int) -> str:
@@ -418,9 +433,10 @@ def parse_opf(
             if ref_type not in GUIDE_SKIP_TYPES or not href:
                 continue
 
-            full_path = posixpath.normpath(
-                posixpath.join(opf_dir, href.split("#", 1)[0])
-            )
+            try:
+                full_path = resolve_href(opf_path, href)
+            except ValueError:
+                continue
 
             if not (
                 full_path.startswith("../")

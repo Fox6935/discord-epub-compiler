@@ -13,9 +13,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from config import DB_PATH, GUILD_ID
 from epub_tools import (
-    find_container_rootfile, get_text_content, guess_media_type, local_name, parse_opf,
-    parse_xml, safe_zip_read, validate_epub_basics, validate_zip_member_names,
-    validate_zip_sizes,
+    extract_book_content, find_container_rootfile, get_text_content, guess_media_type,
+    local_name, parse_opf, parse_xml, raw_deflate_size, safe_zip_read, validate_epub_basics,
+    validate_zip_member_names, validate_zip_sizes,
 )
 from models import EpubEntry
 
@@ -208,6 +208,8 @@ class ArchiveDB:
               source_size INTEGER CHECK(source_size IS NULL OR source_size >= 0),
               epub_fingerprint BLOB CHECK(epub_fingerprint IS NULL OR length(epub_fingerprint) = 32),
               component_count INTEGER CHECK(component_count IS NULL OR component_count >= 0),
+              estimated_compiled_chapter_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_compiled_chapter_bytes >= 0),
+              estimated_compiled_chapter_count INTEGER NOT NULL DEFAULT 0 CHECK(estimated_compiled_chapter_count >= 0),
               FOREIGN KEY(book_id) REFERENCES book(id)
             );
             CREATE TABLE IF NOT EXISTS blob (
@@ -237,6 +239,15 @@ class ArchiveDB:
               is_manifest_item INTEGER NOT NULL DEFAULT 1 CHECK(is_manifest_item IN (0, 1)),
               is_cover_image INTEGER NOT NULL DEFAULT 0 CHECK(is_cover_image IN (0, 1)),
               PRIMARY KEY(epub_version_id, internal_path),
+              FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
+              FOREIGN KEY(blob_hash) REFERENCES blob(hash)
+            );
+            CREATE TABLE IF NOT EXISTS epub_output_image (
+              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
+              blob_hash BLOB NOT NULL CHECK(length(blob_hash) = 32),
+              size_uncompressed INTEGER NOT NULL CHECK(size_uncompressed >= 0),
+              estimated_stored_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_stored_bytes >= 0),
+              PRIMARY KEY(epub_version_id, blob_hash),
               FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
               FOREIGN KEY(blob_hash) REFERENCES blob(hash)
             );
@@ -309,12 +320,31 @@ class ArchiveDB:
             CREATE INDEX IF NOT EXISTS epub_version_filename_idx ON epub_version(original_filename);
             CREATE INDEX IF NOT EXISTS epub_component_blob_idx ON epub_component(blob_hash);
             CREATE INDEX IF NOT EXISTS epub_component_version_idx ON epub_component(epub_version_id);
+            CREATE INDEX IF NOT EXISTS epub_output_image_version_idx ON epub_output_image(epub_version_id);
             CREATE UNIQUE INDEX IF NOT EXISTS discord_epub_unique_idx ON discord_epub(channel_id, message_id, attachment_index);
             CREATE INDEX IF NOT EXISTS discord_epub_channel_effective_order_idx ON discord_epub(channel_id, is_deleted, effective_order);
             CREATE INDEX IF NOT EXISTS watched_channel_watch_idx ON watched_channel(watch_enabled, historical_scan_complete);
             CREATE INDEX IF NOT EXISTS watched_category_watch_idx ON watched_category(watch_enabled);
             CREATE INDEX IF NOT EXISTS import_failure_channel_idx ON import_failure(channel_id, message_id);
             """
+        )
+        self._ensure_column_sync(
+            conn,
+            "epub_version",
+            "estimated_compiled_chapter_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column_sync(
+            conn,
+            "epub_version",
+            "estimated_compiled_chapter_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column_sync(
+            conn,
+            "epub_output_image",
+            "estimated_stored_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
         )
         added_cover_column = self._ensure_column_sync(
             conn,
@@ -445,55 +475,15 @@ class ArchiveDB:
               d.epub_version_id,
               d.effective_order,
               d.is_deleted,
-              COALESCE(
-                SUM(
-                  CASE
-                    WHEN c.spine_order IS NOT NULL
-                     AND c.media_type IN ('application/xhtml+xml', 'text/html', 'application/xml')
-                    THEN b.size_stored
-                    ELSE 0
-                  END
-                ),
-                0
-              ) AS estimated_chapter_bytes
+              v.estimated_compiled_chapter_bytes AS estimated_chapter_bytes,
+              v.estimated_compiled_chapter_count AS estimated_chapter_count
             FROM discord_epub d
-            LEFT JOIN epub_component c ON c.epub_version_id = d.epub_version_id
-            LEFT JOIN blob b ON b.hash = c.blob_hash
+            JOIN epub_version v ON v.id = d.epub_version_id
             WHERE d.guild_id = ? AND d.channel_id = ? {deleted_filter}
-            GROUP BY d.id
             ORDER BY d.effective_order DESC
             """,
             (GUILD_ID, channel_id),
         ).fetchall()
-
-        image_blob_sizes_by_version: Dict[int, List[Tuple[str, int]]] = {}
-        version_ids = [row["epub_version_id"] for row in rows]
-
-        if version_ids:
-            placeholders = ",".join("?" for _ in version_ids)
-            image_rows = conn.execute(
-                f"""
-                SELECT epub_version_id, hex(blob_hash) AS blob_hash, MAX(size_uncompressed) AS size_uncompressed
-                FROM epub_component
-                WHERE epub_version_id IN ({placeholders})
-                  AND media_type LIKE 'image/%'
-                  AND media_type != 'image/svg+xml'
-                  AND is_cover_image = 0
-                GROUP BY epub_version_id, blob_hash
-                """,
-                version_ids,
-            ).fetchall()
-
-            for image_row in image_rows:
-                image_blob_sizes_by_version.setdefault(
-                    image_row["epub_version_id"],
-                    [],
-                ).append(
-                    (
-                        image_row["blob_hash"],
-                        image_row["size_uncompressed"],
-                    )
-                )
 
         return [
             EpubEntry(
@@ -509,19 +499,54 @@ class ArchiveDB:
                 effective_order=row["effective_order"],
                 is_deleted=bool(row["is_deleted"]),
                 estimated_chapter_bytes=row["estimated_chapter_bytes"],
-                estimated_image_bytes=sum(
-                    size
-                    for _, size in image_blob_sizes_by_version.get(
-                        row["epub_version_id"],
-                        [],
-                    )
-                ),
-                image_blob_sizes=tuple(
-                    image_blob_sizes_by_version.get(row["epub_version_id"], [])
-                ),
+                estimated_chapter_count=row["estimated_chapter_count"],
             )
             for row in rows
         ]
+
+    async def output_image_sizes(
+        self,
+        epub_version_ids: Iterable[int],
+    ) -> Dict[int, List[Tuple[str, int]]]:
+        clean_ids = sorted({int(value) for value in epub_version_ids})
+
+        if not clean_ids:
+            return {}
+
+        return await self.run(self._output_image_sizes_sync, clean_ids)
+
+    def _output_image_sizes_sync(
+        self,
+        conn: sqlite3.Connection,
+        epub_version_ids: List[int],
+    ) -> Dict[int, List[Tuple[str, int]]]:
+        placeholders = ",".join("?" for _ in epub_version_ids)
+        rows = conn.execute(
+            f"""
+            SELECT
+              epub_version_id,
+              hex(blob_hash) AS blob_hash,
+              MAX(
+                CASE
+                  WHEN estimated_stored_bytes > 0 THEN estimated_stored_bytes
+                  ELSE size_uncompressed
+                END
+              ) AS estimated_stored_bytes
+            FROM epub_output_image
+            WHERE epub_version_id IN ({placeholders})
+            GROUP BY epub_version_id, blob_hash
+            """,
+            epub_version_ids,
+        ).fetchall()
+
+        sizes_by_version: Dict[int, List[Tuple[str, int]]] = {}
+
+        for row in rows:
+            sizes_by_version.setdefault(row["epub_version_id"], []).append(
+                (row["blob_hash"], row["estimated_stored_bytes"])
+            )
+
+        return sizes_by_version
 
     async def reconstruct_epub(self, epub_version_id: int) -> bytes:
         return await self.run(self._reconstruct_epub_sync, epub_version_id)
@@ -604,6 +629,10 @@ class ArchiveDB:
             validate_zip_member_names(zf)
             validate_zip_sizes(zf)
             validate_epub_basics(zf)
+            try:
+                opf_path = validate_internal_zip_path(find_container_rootfile(zf))
+            except Exception:
+                opf_path = ""
             title, creator, manifest_types, spine_orders, cover_image_paths = parse_opf_metadata_from_zip(zf)
             canonical_key = normalize_key(f"{title} {creator}" if title else filename)
             book_row = conn.execute(
@@ -636,13 +665,83 @@ class ArchiveDB:
                 components.append((internal_path, media_type, blob_hash, compression, stored, len(data), spine_order, is_manifest_item, is_cover_image))
                 fingerprint_parts.append((internal_path, blob_hash))
 
+            estimate_chapter_bytes = 0
+            estimate_chapter_count = 0
+            output_image_sizes: Dict[bytes, Tuple[int, int]] = {}
+            can_prune_components = False
+
+            try:
+                estimated_chapters, estimated_images = extract_book_content(
+                    epub_bytes=epub_bytes,
+                    used_chapter_names=set(),
+                    used_image_names=set(),
+                    image_hash_to_name={},
+                    remove_all_images=False,
+                )
+                estimate_chapter_bytes = sum(
+                    raw_deflate_size(chapter_data)
+                    for _, _, chapter_data in estimated_chapters
+                )
+                estimate_chapter_count = len(estimated_chapters)
+                output_image_sizes = {
+                    hashlib.sha256(image_data).digest(): (
+                        len(image_data),
+                        raw_deflate_size(image_data),
+                    )
+                    for image_data in estimated_images.values()
+                }
+                can_prune_components = True
+            except Exception:
+                estimate_chapter_bytes = sum(
+                    len(stored)
+                    for _, media_type, _, _, stored, _, spine_order, _, _ in components
+                    if spine_order is not None
+                    and media_type in {"application/xhtml+xml", "text/html", "application/xml"}
+                )
+                estimate_chapter_count = sum(
+                    1
+                    for _, media_type, _, _, _, _, spine_order, _, _ in components
+                    if spine_order is not None
+                    and media_type in {"application/xhtml+xml", "text/html", "application/xml"}
+                )
+
+            if can_prune_components:
+                required_paths = {"mimetype", "META-INF/container.xml"}
+
+                if opf_path:
+                    required_paths.add(opf_path)
+
+                output_image_hashes = set(output_image_sizes)
+                components = [
+                    component
+                    for component in components
+                    if component[0] in required_paths
+                    or (
+                        component[6] is not None
+                        and component[1] in {"application/xhtml+xml", "text/html", "application/xml"}
+                    )
+                    or component[2] in output_image_hashes
+                ]
+
             fingerprint = compute_epub_fingerprint(fingerprint_parts)
             cur = conn.execute(
                 """
-                INSERT INTO epub_version(book_id, original_filename, imported_at, source_size, epub_fingerprint, component_count)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO epub_version(
+                  book_id, original_filename, imported_at, source_size, epub_fingerprint,
+                  component_count, estimated_compiled_chapter_bytes, estimated_compiled_chapter_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (book_id, filename, now, attachment_size, fingerprint, len(components)),
+                (
+                    book_id,
+                    filename,
+                    now,
+                    attachment_size,
+                    fingerprint,
+                    len(components),
+                    estimate_chapter_bytes,
+                    estimate_chapter_count,
+                ),
             )
             epub_version_id = cur.lastrowid
 
@@ -661,6 +760,22 @@ class ArchiveDB:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image),
+                )
+
+            for blob_hash, (size_uncompressed, estimated_stored_bytes) in output_image_sizes.items():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO epub_output_image(
+                      epub_version_id, blob_hash, size_uncompressed, estimated_stored_bytes
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        epub_version_id,
+                        blob_hash,
+                        size_uncompressed,
+                        estimated_stored_bytes,
+                    ),
                 )
 
             watch_row = conn.execute(

@@ -8,7 +8,7 @@ import discord
 
 from compiler import compile_selected_epubs
 from config import SESSION_TIMEOUT_SECONDS, has_compile_action_permission
-from db import move_epub_after, soft_delete_epubs, undelete_epubs
+from db import ARCHIVE, move_epub_after, soft_delete_epubs, undelete_epubs
 from epub_tools import (
     disable_view_items, format_bytes, resolve_upload_limit_bytes, safe_default_output_name,
     sanitize_author, sanitize_output_name,
@@ -38,6 +38,30 @@ def format_compact_estimate(size: int) -> str:
         return f"{round(value):.0f}{unit}"
 
     return f"{value:.1f}{unit}"
+
+
+async def ensure_selected_image_sizes(session: CompileSession) -> None:
+    version_ids = [
+        entry.epub_version_id
+        for entry in session.entries
+        if entry.entry_id in session.selected_ids
+        and entry.epub_version_id not in session.loaded_image_version_ids
+    ]
+
+    if not version_ids:
+        return
+
+    sizes_by_version = await ARCHIVE.output_image_sizes(version_ids)
+
+    for entry in session.entries:
+        if entry.epub_version_id not in version_ids:
+            continue
+
+        image_blob_sizes = tuple(sizes_by_version.get(entry.epub_version_id, []))
+        entry.image_blob_sizes = image_blob_sizes
+        entry.estimated_image_bytes = sum(size for _, size in image_blob_sizes)
+
+    session.loaded_image_version_ids.update(version_ids)
 
 
 class EpubPickerSelect(discord.ui.Select):
@@ -117,6 +141,9 @@ class EpubPickerSelect(discord.ui.Select):
             else:
                 session.selected_ids.difference_update(page_ids)
                 session.selected_ids.update(self.values)
+
+            if session.flow_mode == "compile":
+                await ensure_selected_image_sizes(session)
 
             new_view = CompileLayoutView(session)
             new_view.message = view.message
@@ -263,6 +290,7 @@ class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
             page_entries = view.session.current_page_entries()
             page_ids = {e.entry_id for e in page_entries}
             view.session.selected_ids.update(page_ids)
+            await ensure_selected_image_sizes(view.session)
 
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
@@ -379,6 +407,21 @@ class CompileLayoutView(discord.ui.LayoutView):
         if page_entries:
             self.add_item(discord.ui.ActionRow(EpubPickerSelect(session)))
 
+        if session.flow_mode in {"compile", "delete"} and session.filename_filter.is_active:
+            visible_ids = {entry.entry_id for entry in session.display_entries()}
+            hidden_selected_count = sum(
+                1
+                for entry_id in session.selected_ids
+                if entry_id not in visible_ids
+            )
+
+            if hidden_selected_count:
+                self.add_item(
+                    discord.ui.TextDisplay(
+                        f"*An additional {hidden_selected_count} epubs are selected outside filter*"
+                    )
+                )
+
         self.add_item(discord.ui.TextDisplay(status_line))
 
         page_buttons = [
@@ -411,12 +454,6 @@ class CompileLayoutView(discord.ui.LayoutView):
                     OpenSearchModalButton(session.filename_filter.is_active),
                 )
             )
-        else:
-            self.add_item(
-                discord.ui.ActionRow(
-                    OpenSearchModalButton(session.filename_filter.is_active),
-                )
-            )
 
         if session.flow_mode == "compile":
             estimated_size = session.estimated_output_bytes()
@@ -432,6 +469,9 @@ class CompileLayoutView(discord.ui.LayoutView):
 
             compile_controls.append(OpenCompileModalButton(estimate_text))
             self.add_item(discord.ui.ActionRow(*compile_controls))
+
+            if estimate_text is not None:
+                self.add_item(discord.ui.TextDisplay("**epub size is an estimation*"))
         elif session.flow_mode == "delete":
             self.add_item(discord.ui.ActionRow(DeleteConfirmButton()))
         elif session.flow_mode == "reorder_move":
@@ -577,11 +617,6 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             )
             return
 
-        queue_hint = ""
-
-        if COMPILE_SEMAPHORE.locked():
-            queue_hint = "\nAnother compile is running, so yours may wait briefly."
-
         log(
             f"Compiling {len(selected)} EPUB(s) "
             f"for {interaction.user} in #{self.session.channel_name} "
@@ -590,14 +625,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
 
         upload_limit = resolve_upload_limit_bytes(interaction)
 
-        await interaction.response.send_message(
-            (
-                f"Compiling {len(selected)} EPUB(s)...\n"
-                f"Remove images: {'yes' if remove_all_images else 'no'}"
-                f"{queue_hint}"
-            ),
-            ephemeral=True,
-        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
             async with COMPILE_SEMAPHORE:
@@ -780,7 +808,16 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
             undelete_ids,
         )
 
-        await interaction.response.send_message(
+        self.session.entries = await ARCHIVE.list_channel_epubs(
+            self.session.channel_id,
+            include_deleted=True,
+        )
+        self.session.selected_ids.clear()
+        self.session.loaded_image_version_ids.clear()
+        self.session.touch()
+
+        await interaction.response.edit_message(view=CompileLayoutView(self.session))
+        await interaction.followup.send(
             f"Soft-deleted {deleted_count} EPUB(s). Restored {restored_count} EPUB(s).",
             ephemeral=True,
         )
@@ -858,6 +895,19 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
             moving_entry.discord_epub_id,
             target_id,
         )
-        await interaction.response.send_message("Reorder saved.", ephemeral=True)
+        session.entries = await ARCHIVE.list_channel_epubs(
+            session.channel_id,
+            include_deleted=False,
+        )
+        session.selected_ids.clear()
+        session.placement_ids.clear()
+        session.reorder_moving_id = None
+        session.loaded_image_version_ids.clear()
+        session.flow_mode = "reorder_move"
+        session.current_page = 0
+        session.touch()
+
+        await interaction.response.edit_message(view=CompileLayoutView(session))
+        await interaction.followup.send("Reorder saved.", ephemeral=True)
 
 

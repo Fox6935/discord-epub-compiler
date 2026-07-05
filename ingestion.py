@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import random
 import sqlite3
 import traceback
 from datetime import timedelta, timezone
+from time import monotonic
 from typing import Any, Dict, Optional, Set
 
 import aiohttp
@@ -11,7 +13,7 @@ import discord
 from config import (
     CATEGORY_RECONCILE_SECONDS, GUILD_ID, HISTORY_BATCH_SIZE, HTTP_TIMEOUT_SECONDS,
     LIVE_IMPORT_DELAY_SECONDS, LIVE_IMPORT_RATE_SECONDS, MAX_SOURCE_EPUB_BYTES,
-    get_configured_guild, is_configured_guild,
+    SCAN_WATCHDOG_SECONDS, get_configured_guild, is_configured_guild,
 )
 from db import (
     ARCHIVE, advance_channel_last_processed_message, get_watched_channel_row,
@@ -25,14 +27,21 @@ from models import (
 )
 from config import MAX_SESSION_LIFETIME_SECONDS, SESSION_TIMEOUT_SECONDS
 
-SCAN_QUEUE: asyncio.Queue[discord.TextChannel] = asyncio.Queue()
+SCAN_QUEUE: asyncio.Queue[tuple[discord.TextChannel, str]] = asyncio.Queue()
 QUEUED_SCAN_CHANNEL_IDS: Set[int] = set()
 ACTIVE_SCAN_CHANNEL_IDS: Set[int] = set()
+ACTIVE_SCAN_HEARTBEATS: Dict[int, float] = {}
 SCAN_WORKER_STARTED = False
 LIVE_IMPORT_QUEUE: asyncio.Queue[tuple[discord.Message, int]] = asyncio.Queue()
 QUEUED_LIVE_IMPORT_KEYS: Set[tuple[int, int, int]] = set()
 LIVE_IMPORT_PENDING_BY_MESSAGE: Dict[tuple[int, int], int] = {}
 LIVE_IMPORT_WORKER_STARTED = False
+IMPORTING_ATTACHMENT_KEYS: Set[tuple[int, int, int]] = set()
+IMPORTING_ATTACHMENT_LOCK = asyncio.Lock()
+
+
+def touch_scan_heartbeat(channel_id: int) -> None:
+    ACTIVE_SCAN_HEARTBEATS[channel_id] = monotonic()
 
 
 def is_eligible_watch_channel(channel: Any) -> bool:
@@ -151,6 +160,8 @@ async def import_message_epubs(
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as http:
         for idx, att in epub_attachments:
+            import_key = (message.channel.id, message.id, idx)
+
             if await ARCHIVE.is_discord_epub_imported(
                 message.channel.id,
                 message.id,
@@ -158,48 +169,58 @@ async def import_message_epubs(
             ):
                 continue
 
-            last_error: Optional[Exception] = None
-            for attempt in range(3):
-                try:
-                    data = await fetch_attachment_bytes(http, att)
-                    imported = await ARCHIVE.import_epub_bytes(
+            async with IMPORTING_ATTACHMENT_LOCK:
+                if import_key in IMPORTING_ATTACHMENT_KEYS:
+                    continue
+
+                IMPORTING_ATTACHMENT_KEYS.add(import_key)
+
+            try:
+                last_error: Optional[Exception] = None
+                for attempt in range(3):
+                    try:
+                        data = await fetch_attachment_bytes(http, att)
+                        imported = await ARCHIVE.import_epub_bytes(
+                            guild_id=GUILD_ID,
+                            channel_id=message.channel.id,
+                            message_id=message.id,
+                            attachment_index=idx,
+                            filename=att.filename,
+                            attachment_size=att.size,
+                            message_created_at=message.created_at,
+                            epub_bytes=data,
+                        )
+                        if imported:
+                            imported_count += 1
+                            if scan_progress is not None:
+                                scan_progress.archived_epubs += 1
+                                scan_progress.update(att.filename)
+                            else:
+                                channel_name = safe_log_text(getattr(message.channel, "name", message.channel.id), 80)
+                                log_success(f"Archived {safe_log_text(att.filename)} from #{channel_name}")
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 2:
+                            await asyncio.sleep(0.75 * (2**attempt) + random.uniform(0, 0.25))
+
+                if last_error is not None:
+                    log_warning(
+                        f"Import failed for {safe_log_text(att.filename)} "
+                        f"in message {message.id}: {safe_log_text(last_error)}"
+                    )
+                    await ARCHIVE.record_import_failure(
                         guild_id=GUILD_ID,
                         channel_id=message.channel.id,
                         message_id=message.id,
                         attachment_index=idx,
                         filename=att.filename,
-                        attachment_size=att.size,
-                        message_created_at=message.created_at,
-                        epub_bytes=data,
+                        error_text=str(last_error),
                     )
-                    if imported:
-                        imported_count += 1
-                        if scan_progress is not None:
-                            scan_progress.archived_epubs += 1
-                            scan_progress.update(att.filename)
-                        else:
-                            channel_name = safe_log_text(getattr(message.channel, "name", message.channel.id), 80)
-                            log_success(f"Archived {safe_log_text(att.filename)} from #{channel_name}")
-                    last_error = None
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < 2:
-                        await asyncio.sleep(0.75 * (2**attempt) + random.uniform(0, 0.25))
-
-            if last_error is not None:
-                log_warning(
-                    f"Import failed for {safe_log_text(att.filename)} "
-                    f"in message {message.id}: {safe_log_text(last_error)}"
-                )
-                await ARCHIVE.record_import_failure(
-                    guild_id=GUILD_ID,
-                    channel_id=message.channel.id,
-                    message_id=message.id,
-                    attachment_index=idx,
-                    filename=att.filename,
-                    error_text=str(last_error),
-                )
+            finally:
+                async with IMPORTING_ATTACHMENT_LOCK:
+                    IMPORTING_ATTACHMENT_KEYS.discard(import_key)
 
     return imported_count
 
@@ -277,16 +298,17 @@ async def live_import_worker() -> None:
             await asyncio.sleep(LIVE_IMPORT_RATE_SECONDS)
 
 
-async def start_historical_scan(channel: discord.TextChannel) -> None:
+async def start_historical_scan(channel: discord.TextChannel) -> str:
     row = await get_watched_channel_row(channel.id)
     if row is None:
-        return
+        return "skipped"
 
     if row["historical_scan_complete"]:
-        return
+        return "skipped"
 
     progress = ScanProgress(channel.name)
     try:
+        touch_scan_heartbeat(channel.id)
         progress.start()
         await update_channel_cursor(
             channel.id,
@@ -300,6 +322,7 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
             latest = None
             async for msg in channel.history(limit=1):
                 latest = msg
+                touch_scan_heartbeat(channel.id)
                 break
             if latest is None:
                 await normalize_channel_effective_order(channel.id)
@@ -310,7 +333,7 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
                     historical_before_message_id=None,
                 )
                 progress.finish()
-                return
+                return "complete"
             anchor = latest.id
             before_id = latest.id + 1
             await update_channel_cursor(
@@ -323,7 +346,7 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
             current = await get_watched_channel_row(channel.id)
             if current is None:
                 progress.stop_without_summary()
-                return
+                return "stopped"
             before_id = current["historical_before_message_id"] or before_id
             batch = [
                 msg
@@ -332,6 +355,7 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
                     before=discord.Object(id=before_id),
                 )
             ]
+            touch_scan_heartbeat(channel.id)
 
             if not batch:
                 await normalize_channel_effective_order(channel.id)
@@ -343,11 +367,13 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
                     last_error=None,
                 )
                 progress.finish()
-                return
+                return "complete"
 
             for msg in batch:
                 progress.scanned_messages += 1
+                touch_scan_heartbeat(channel.id)
                 await import_message_epubs(msg, scan_progress=progress)
+                touch_scan_heartbeat(channel.id)
                 progress.update()
 
             await update_channel_cursor(
@@ -358,19 +384,32 @@ async def start_historical_scan(channel: discord.TextChannel) -> None:
                     current["last_processed_message_id"] or 0,
                 ),
             )
+            touch_scan_heartbeat(channel.id)
     except discord.Forbidden:
         progress.stop_without_summary()
         await update_channel_cursor(channel.id, last_error="Missing permission to read message history")
         log_warning(f"Cannot scan #{channel.name}: missing Read Message History")
+        return "failed"
+    except asyncio.CancelledError:
+        progress.stop_without_summary()
+        try:
+            await update_channel_cursor(
+                channel.id,
+                last_error="Scan cancelled before completion",
+            )
+        except Exception:
+            pass
+        raise
     except Exception as exc:
         progress.stop_without_summary()
         await update_channel_cursor(channel.id, last_error=str(exc)[:1000])
         log_warning(f"Historical scan failed for #{channel.name}: {exc}")
         if DEBUG_LOGS:
             traceback.print_exc()
+        return "failed"
 
 
-async def enqueue_historical_scan(channel: discord.TextChannel) -> bool:
+async def enqueue_historical_scan(channel: discord.TextChannel, source: str = "channel") -> bool:
     row = await get_watched_channel_row(channel.id)
 
     if row is None or row["historical_scan_complete"]:
@@ -380,7 +419,7 @@ async def enqueue_historical_scan(channel: discord.TextChannel) -> bool:
         return False
 
     QUEUED_SCAN_CHANNEL_IDS.add(channel.id)
-    await SCAN_QUEUE.put(channel)
+    await SCAN_QUEUE.put((channel, source))
     return True
 
 
@@ -388,21 +427,118 @@ def scan_queue_size() -> int:
     return SCAN_QUEUE.qsize()
 
 
+async def requeue_scan_after_watchdog(
+    channel: discord.TextChannel,
+    source: str,
+) -> bool:
+    row = await get_watched_channel_row(channel.id)
+
+    if row is None or row["historical_scan_complete"]:
+        return False
+
+    if channel.id in QUEUED_SCAN_CHANNEL_IDS or channel.id in ACTIVE_SCAN_CHANNEL_IDS:
+        return False
+
+    QUEUED_SCAN_CHANNEL_IDS.add(channel.id)
+    await SCAN_QUEUE.put((channel, source))
+    return True
+
+
+async def run_scan_with_watchdog(channel: discord.TextChannel) -> str:
+    touch_scan_heartbeat(channel.id)
+    scan_task = asyncio.create_task(start_historical_scan(channel))
+    check_seconds = max(1, min(5, SCAN_WATCHDOG_SECONDS // 6 or 1))
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({scan_task}, timeout=check_seconds)
+
+            if scan_task in done:
+                try:
+                    return scan_task.result()
+                except Exception as exc:
+                    log_warning(
+                        f"Historical scan task failed for #{channel.name}: "
+                        f"{safe_log_text(exc)}"
+                    )
+                    return "failed"
+
+            idle_seconds = monotonic() - ACTIVE_SCAN_HEARTBEATS.get(channel.id, monotonic())
+
+            if idle_seconds < SCAN_WATCHDOG_SECONDS:
+                continue
+
+            message = (
+                f"Scan watchdog timeout in #{channel.name} - "
+                f"no progress for {int(idle_seconds)}s; cancelling and re-queueing"
+            )
+            log_warning(message)
+            await update_channel_cursor(
+                channel.id,
+                last_error=message,
+            )
+            scan_task.cancel()
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await scan_task
+
+            await update_channel_cursor(
+                channel.id,
+                last_error=message,
+            )
+            return "watchdog_timeout"
+    except asyncio.CancelledError:
+        scan_task.cancel()
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await scan_task
+
+        raise
+
+
 async def historical_scan_worker() -> None:
     while True:
-        channel = await SCAN_QUEUE.get()
+        channel, source = await SCAN_QUEUE.get()
         QUEUED_SCAN_CHANNEL_IDS.discard(channel.id)
         ACTIVE_SCAN_CHANNEL_IDS.add(channel.id)
+        status = "failed"
 
         try:
-            await start_historical_scan(channel)
+            status = await run_scan_with_watchdog(channel)
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
         finally:
+            ACTIVE_SCAN_HEARTBEATS.pop(channel.id, None)
             ACTIVE_SCAN_CHANNEL_IDS.discard(channel.id)
             SCAN_QUEUE.task_done()
-            log_success(
-                f"Category scan complete for #{channel.name} - "
-                f"Queue remaining: {scan_queue_size()}"
-            )
+
+            if status == "complete":
+                label = {
+                    "category": "Category scan complete",
+                    "startup": "Startup scan complete",
+                }.get(source, "Channel scan complete")
+                log_success(
+                    f"{label} for #{channel.name} - "
+                    f"Queue remaining: {scan_queue_size()}"
+                )
+            elif status in {"failed", "stopped"}:
+                log_warning(
+                    f"Scan stopped before completion for #{channel.name} - "
+                    f"Queue remaining: {scan_queue_size()}"
+                )
+            elif status == "watchdog_timeout":
+                requeued = await requeue_scan_after_watchdog(channel, source)
+                if requeued:
+                    log_warning(
+                        f"Scan watchdog restarted #{channel.name} from saved cursor - "
+                        f"Queue remaining: {scan_queue_size()}"
+                    )
+                else:
+                    log_warning(
+                        f"Scan watchdog stopped #{channel.name}; channel is no longer queued "
+                        "or historical scan is already complete"
+                    )
 
 
 def ensure_scan_worker_started() -> None:
@@ -510,11 +646,11 @@ async def reconcile_watched_category(category: discord.CategoryChannel) -> int:
         before = await get_watched_channel_row(channel.id)
         await upsert_watched_channel(channel, True)
         if before is None:
-            if await enqueue_historical_scan(channel):
+            if await enqueue_historical_scan(channel, source="category"):
                 added += 1
                 queued += 1
         elif not before["historical_scan_complete"]:
-            if await enqueue_historical_scan(channel):
+            if await enqueue_historical_scan(channel, source="category"):
                 queued += 1
 
     await ARCHIVE.run(
@@ -527,11 +663,12 @@ async def reconcile_watched_category(category: discord.CategoryChannel) -> int:
             (category.name, unix_now(), category.id),
         )
     )
-    log_success(
-        f"Category scan initialized for {category.name} - "
-        f"Checked {checked} channels - Added {queued} channel(s) to queue - "
-        f"New channels: {added} - Total in queue: {scan_queue_size()}"
-    )
+    if queued:
+        log_success(
+            f"Category scan initialized for {category.name} - "
+            f"Checked {checked} channels - Added {queued} channel(s) to queue - "
+            f"New channels: {added} - Total in queue: {scan_queue_size()}"
+        )
     return added
 
 
@@ -577,7 +714,7 @@ async def startup_channel_work() -> None:
         asyncio.create_task(retry_channel_import_failures(channel))
         asyncio.create_task(catch_up_channel(channel))
         if not row["historical_scan_complete"]:
-            await enqueue_historical_scan(channel)
+            await enqueue_historical_scan(channel, source="startup")
 
 
 def log_channel_permission_diagnostics(channel: discord.TextChannel) -> None:

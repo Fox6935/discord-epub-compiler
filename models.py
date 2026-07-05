@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from config import (
-    EPUB_SHELL_OVERHEAD_BYTES,
+    EPUB_BASE_OVERHEAD_BYTES,
+    EPUB_PER_CHAPTER_OVERHEAD_BYTES,
+    EPUB_PER_IMAGE_OVERHEAD_BYTES,
     MAX_CONCURRENT_COMPILES,
     PAGE_SIZE,
 )
@@ -193,6 +195,7 @@ class EpubEntry:
     effective_order: int
     is_deleted: bool = False
     estimated_chapter_bytes: int = 0
+    estimated_chapter_count: int = 0
     estimated_image_bytes: int = 0
     image_blob_sizes: Tuple[Tuple[str, int], ...] = ()
 
@@ -209,6 +212,7 @@ class CompileSession:
     flow_mode: str = "compile"
     reorder_moving_id: Optional[str] = None
     filename_filter: FilenameFilter = field(default_factory=FilenameFilter)
+    loaded_image_version_ids: Set[int] = field(default_factory=set)
     remove_all_images: bool = False
     expired: bool = False
     created_at: datetime = field(default_factory=now_utc)
@@ -283,6 +287,7 @@ class CompileSession:
             return None
 
         chapter_bytes = sum(entry.estimated_chapter_bytes for entry in selected)
+        chapter_count = sum(entry.estimated_chapter_count for entry in selected)
         image_bytes = 0
 
         if not self.remove_all_images:
@@ -293,11 +298,16 @@ class CompileSession:
                     image_sizes_by_hash.setdefault(blob_hash, blob_size)
 
             image_bytes = sum(image_sizes_by_hash.values())
+            image_count = len(image_sizes_by_hash)
+        else:
+            image_count = 0
 
         return (
             chapter_bytes
             + image_bytes
-            + EPUB_SHELL_OVERHEAD_BYTES
+            + EPUB_BASE_OVERHEAD_BYTES
+            + (chapter_count * EPUB_PER_CHAPTER_OVERHEAD_BYTES)
+            + (image_count * EPUB_PER_IMAGE_OVERHEAD_BYTES)
         )
 
     def selected_image_bytes(self) -> int:
