@@ -22,97 +22,115 @@ from models import CompileSession, SESSIONS, build_session_key, log, log_success
 from ui import CompileLayoutView
 
 
-def choice_value(value: object) -> str:
-    if isinstance(value, app_commands.Choice):
-        return str(value.value)
+class RoleManageView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
 
-    if value is None:
-        return ""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This role picker isn't yours.",
+                ephemeral=True,
+            )
+            return False
 
-    return str(value)
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "You need Administrator to manage compile roles.",
+                ephemeral=True,
+            )
+            return False
 
-
-def parse_role_id(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-
-    text = value.strip()
-
-    if text.startswith("<@&") and text.endswith(">"):
-        text = text[3:-1]
-
-    if not text.isdecimal():
-        return None
-
-    return int(text)
+        return True
 
 
-async def compile_role_autocomplete(
-    interaction: discord.Interaction,
-    current: str,
-) -> list[app_commands.Choice[str]]:
-    if interaction.guild is None or not is_configured_guild(interaction.guild):
-        return []
+class AddCompileRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select role to add",
+            min_values=1,
+            max_values=1,
+        )
 
-    selected_action = choice_value(getattr(interaction.namespace, "action", None))
+    async def callback(self, interaction: discord.Interaction) -> None:
+        role = self.values[0]
 
-    if selected_action not in {"role_add", "role_delete"}:
-        return []
+        if role.is_default():
+            await interaction.response.send_message(
+                "Choose a real server role.",
+                ephemeral=True,
+            )
+            return
 
-    current = current.lower().strip()
-    configured_ids = set(await list_special_role_ids())
-    choices: list[app_commands.Choice[str]] = []
+        added = await add_special_role_id(role.id, interaction.user.id)
+        message = (
+            f"{role.mention} can now use `/compile action:delete` and `/compile action:reorder`."
+            if added
+            else f"{role.mention} is already configured."
+        )
 
-    if selected_action == "role_delete":
-        role_ids = sorted(configured_ids)
+        await interaction.response.edit_message(
+            content=message,
+            view=None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
-        for role_id in role_ids:
-            guild_role = interaction.guild.get_role(role_id)
-            label = guild_role.name if guild_role is not None else f"Missing role {role_id}"
 
-            if current and current not in label.lower() and current not in str(role_id):
-                continue
+class DeleteCompileRoleSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild, role_ids: list[int]):
+        options = []
 
-            choices.append(
-                app_commands.Choice(
-                    name=label[:100],
+        for role_id in role_ids[:25]:
+            role = guild.get_role(role_id)
+            label = role.name if role is not None else f"Missing role {role_id}"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
                     value=str(role_id),
                 )
             )
 
-            if len(choices) >= 25:
-                break
-
-        return choices
-
-    roles = [
-        role
-        for role in interaction.guild.roles
-        if not role.is_default() and role.id not in configured_ids
-    ]
-    roles.sort(key=lambda role: (-role.position, role.name.lower()))
-
-    for guild_role in roles:
-        if current and current not in guild_role.name.lower():
-            continue
-
-        choices.append(
-            app_commands.Choice(
-                name=guild_role.name[:100],
-                value=str(guild_role.id),
-            )
+        super().__init__(
+            placeholder="Select role to delete",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
 
-        if len(choices) >= 25:
-            break
+    async def callback(self, interaction: discord.Interaction) -> None:
+        role_id = int(self.values[0])
+        role = interaction.guild.get_role(role_id) if interaction.guild else None
+        deleted = await delete_special_role_id(role_id)
+        role_label = role.mention if role is not None else f"`{role_id}`"
+        message = (
+            f"{role_label} removed from compile delete/reorder access."
+            if deleted
+            else "That role is not configured."
+        )
 
-    return choices
+        await interaction.response.edit_message(
+            content=message,
+            view=None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class AddCompileRoleView(RoleManageView):
+    def __init__(self, user_id: int):
+        super().__init__(user_id)
+        self.add_item(AddCompileRoleSelect())
+
+
+class DeleteCompileRoleView(RoleManageView):
+    def __init__(self, user_id: int, guild: discord.Guild, role_ids: list[int]):
+        super().__init__(user_id)
+        self.add_item(DeleteCompileRoleSelect(guild, role_ids))
 
 
 @bot.tree.command(name="compile", description="Compile or manage archived EPUBs in this channel")
 @app_commands.describe(
     action="Optional admin action",
-    role="Role to add or delete",
 )
 @app_commands.choices(
     action=[
@@ -122,11 +140,9 @@ async def compile_role_autocomplete(
         app_commands.Choice(name="role_delete", value="role_delete"),
     ]
 )
-@app_commands.autocomplete(role=compile_role_autocomplete)
 async def compile_command(
     interaction: discord.Interaction,
     action: Optional[app_commands.Choice[str]] = None,
-    role: Optional[str] = None,
 ) -> None:
     if interaction.guild is None or interaction.channel is None:
         await interaction.response.send_message(
@@ -153,61 +169,26 @@ async def compile_command(
             )
             return
 
-        role_id = parse_role_id(role)
-
-        if role_id is None:
-            await interaction.response.send_message(
-                "Choose a role from the role autocomplete.",
-                ephemeral=True,
-            )
-            return
-
-        guild_role = interaction.guild.get_role(role_id)
-
         if selected_action == "role_add":
-            if guild_role is None or guild_role.is_default():
-                await interaction.response.send_message(
-                    "Choose an existing server role.",
-                    ephemeral=True,
-                )
-                return
-
-            added = await add_special_role_id(role_id, interaction.user.id)
-            message = (
-                f"{guild_role.mention} can now use `/compile action:delete` and `/compile action:reorder`."
-                if added
-                else f"{guild_role.mention} is already configured."
-            )
             await interaction.response.send_message(
-                message,
+                "Choose a role to grant compile delete/reorder access.",
+                view=AddCompileRoleView(interaction.user.id),
                 ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
-        deleted = await delete_special_role_id(role_id)
+        role_ids = await list_special_role_ids()
 
-        if guild_role is not None:
-            role_label = guild_role.mention
-        else:
-            role_label = f"`{role_id}`"
-
-        message = (
-            f"{role_label} removed from compile delete/reorder access."
-            if deleted
-            else "That role is not configured."
-        )
+        if not role_ids:
+            await interaction.response.send_message(
+                "No compile roles are configured.",
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.send_message(
-            message,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        return
-
-    if role is not None:
-        await interaction.response.send_message(
-            "Role options are only used with `/compile action:role_add` or `action:role_delete`.",
+            "Choose a role to remove from compile delete/reorder access.",
+            view=DeleteCompileRoleView(interaction.user.id, interaction.guild, role_ids),
             ephemeral=True,
         )
         return

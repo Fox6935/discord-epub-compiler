@@ -79,13 +79,13 @@ Requires Discord Administrator.
 
 Available to regular users in archived channels.
 
-- No action: select archived EPUBs and compile them
-- `action:delete`: soft-delete active EPUBs or restore already deleted EPUBs
-- `action:reorder`: move one EPUB between adjacent neighbors
-- `action:role_add role:<role>`: allow that role to use delete/reorder
-- `action:role_delete role:<role>`: remove that role's delete/reorder access
+- `/compile` No action: select archived EPUBs and compile them
+- `/compile action:delete`: soft-delete active EPUBs or restore already deleted EPUBs
+- `/compile action:reorder`: move one EPUB between adjacent neighbors
+- `/compile action:role_add`: open a role picker to grant delete/reorder access
+- `/compile action:role_delete`: open a configured-role picker to remove delete/reorder access
 
-`action:role_add` and `action:role_delete` require Discord Administrator. The add list suggests server roles that are not already configured. The delete list suggests only configured roles. Delete and reorder require Discord Administrator or one configured role.
+`action:role_add` and `action:role_delete` require Discord Administrator. Delete and reorder require Discord Administrator or a configured role.
 
 ## Archive Files
 
