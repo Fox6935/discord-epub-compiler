@@ -7,13 +7,56 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("DISCORD_GUILD_ID") or os.getenv("GUILD_ID") or "0")
 DEFAULT_DB_PATH = "/compileSQL/epub_archive.sqlite3"
-DB_PATH = (os.getenv("EPUB_ARCHIVE_DB") or DEFAULT_DB_PATH).strip()
-SPECIAL_ROLE_ID = int(os.getenv("SPECIAL_ROLE_ID", "0") or "0")
-EXTERNAL_UPLOAD_URL = (os.getenv("api_url") or os.getenv("API_URL") or "").strip()
-EXTERNAL_UPLOAD_KEY = (os.getenv("api_key") or os.getenv("API_KEY") or "").strip()
+
+
+def env_first(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+
+        if value is not None:
+            return value
+
+    return default
+
+
+def env_required_text(name: str, default: str) -> str:
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    clean = value.strip()
+
+    if not clean:
+        raise RuntimeError(f"{name} is set but empty.")
+
+    return clean
+
+
+def env_optional_text(names: tuple[str, ...]) -> str:
+    value = env_first(names, "")
+    return value.strip()
+
+
+def env_int(names: tuple[str, ...], default: int) -> int:
+    value = env_first(names, str(default)).strip()
+
+    if not value:
+        raise RuntimeError(f"{'/'.join(names)} is set but empty.")
+
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{'/'.join(names)} must be an integer.") from exc
+
+
+TOKEN = os.environ.get("DISCORD_TOKEN")
+GUILD_ID = env_int(("DISCORD_GUILD_ID", "GUILD_ID"), 0)
+DB_PATH = env_required_text("EPUB_ARCHIVE_DB", DEFAULT_DB_PATH)
+SPECIAL_ROLE_ID = env_int(("SPECIAL_ROLE_ID",), 0)
+EXTERNAL_UPLOAD_URL = env_optional_text(("api_url", "API_URL"))
+EXTERNAL_UPLOAD_KEY = env_optional_text(("api_key", "API_KEY"))
 
 SESSION_TIMEOUT_SECONDS = 15 * 60
 MAX_SESSION_LIFETIME_SECONDS = 60 * 60
@@ -30,8 +73,9 @@ MAX_SINGLE_FILE_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 MAX_ZIP_MEMBERS = 5000
 DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_EPUB_BYTES = DEFAULT_UPLOAD_LIMIT_BYTES
-MAX_EXTERNAL_OUTPUT_EPUB_BYTES = int(
-    os.getenv("MAX_EXTERNAL_OUTPUT_EPUB_BYTES", str(200 * 1024 * 1024))
+MAX_EXTERNAL_OUTPUT_EPUB_BYTES = env_int(
+    ("MAX_EXTERNAL_OUTPUT_EPUB_BYTES",),
+    200 * 1024 * 1024,
 )
 EPUB_BASE_OVERHEAD_BYTES = 8 * 1024
 EPUB_PER_CHAPTER_OVERHEAD_BYTES = 160
