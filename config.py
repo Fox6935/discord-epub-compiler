@@ -10,38 +10,11 @@ load_dotenv()
 DEFAULT_DB_PATH = "/compileSQL/epub_archive.sqlite3"
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
-
-_guild_id_text = os.environ.get("DISCORD_GUILD_ID")
-if _guild_id_text is None:
-    _guild_id_text = os.environ.get("GUILD_ID")
-if _guild_id_text is None:
-    GUILD_ID = 0
-else:
-    GUILD_ID = int(_guild_id_text)
-
-_db_path_text = os.environ.get("EPUB_ARCHIVE_DB")
-if _db_path_text is None:
-    DB_PATH = DEFAULT_DB_PATH
-else:
-    DB_PATH = _db_path_text
-
-_special_role_id_text = os.environ.get("SPECIAL_ROLE_ID")
-if _special_role_id_text is None:
-    SPECIAL_ROLE_ID = 0
-else:
-    SPECIAL_ROLE_ID = int(_special_role_id_text)
-
-EXTERNAL_UPLOAD_URL = os.environ.get("api_url")
-if EXTERNAL_UPLOAD_URL is None:
-    EXTERNAL_UPLOAD_URL = os.environ.get("API_URL")
-if EXTERNAL_UPLOAD_URL is None:
-    EXTERNAL_UPLOAD_URL = ""
-
-EXTERNAL_UPLOAD_KEY = os.environ.get("api_key")
-if EXTERNAL_UPLOAD_KEY is None:
-    EXTERNAL_UPLOAD_KEY = os.environ.get("API_KEY")
-if EXTERNAL_UPLOAD_KEY is None:
-    EXTERNAL_UPLOAD_KEY = ""
+GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", os.environ.get("GUILD_ID", "0")))
+DB_PATH = os.environ.get("EPUB_ARCHIVE_DB", DEFAULT_DB_PATH)
+SPECIAL_ROLE_ID = int(os.environ.get("SPECIAL_ROLE_ID", "0"))
+EXTERNAL_UPLOAD_URL = os.environ.get("api_url", os.environ.get("API_URL", ""))
+EXTERNAL_UPLOAD_KEY = os.environ.get("api_key", os.environ.get("API_KEY", ""))
 
 SESSION_TIMEOUT_SECONDS = 15 * 60
 MAX_SESSION_LIFETIME_SECONDS = 60 * 60
@@ -58,11 +31,9 @@ MAX_SINGLE_FILE_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
 MAX_ZIP_MEMBERS = 5000
 DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_EPUB_BYTES = DEFAULT_UPLOAD_LIMIT_BYTES
-_max_external_output_text = os.environ.get("MAX_EXTERNAL_OUTPUT_EPUB_BYTES")
-if _max_external_output_text is None:
-    MAX_EXTERNAL_OUTPUT_EPUB_BYTES = 200 * 1024 * 1024
-else:
-    MAX_EXTERNAL_OUTPUT_EPUB_BYTES = int(_max_external_output_text)
+MAX_EXTERNAL_OUTPUT_EPUB_BYTES = int(
+    os.environ.get("MAX_EXTERNAL_OUTPUT_EPUB_BYTES", 200 * 1024 * 1024)
+)
 EPUB_BASE_OVERHEAD_BYTES = 8 * 1024
 EPUB_PER_CHAPTER_OVERHEAD_BYTES = 160
 EPUB_PER_IMAGE_OVERHEAD_BYTES = 80
