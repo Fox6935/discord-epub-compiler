@@ -56,7 +56,7 @@ async def compile_selected_epubs(
                 if image_payload_size > int(max_output_bytes * IMAGE_SIZE_ABORT_RATIO):
                     raise OutputTooLargeError(
                         "Compilation aborted before reconstructing remaining EPUBs.\n"
-                        "Images alone are near or above the Discord upload limit.\n"
+                        "Images alone are near or above the configured output limit.\n"
                         f"Image payload: {format_bytes(image_payload_size)}\n"
                         f"Limit: {format_bytes(max_output_bytes)}\n"
                         "Try again with `Remove images` enabled."
@@ -108,7 +108,7 @@ async def compile_selected_epubs(
 
     if len(output) > max_output_bytes:
         raise OutputTooLargeError(
-            "The compiled EPUB is too large to send through Discord.\n"
+            "The compiled EPUB is above the configured output limit.\n"
             f"Compiled size: {format_bytes(len(output))}\n"
             f"Limit: {format_bytes(max_output_bytes)}\n"
             "Try selecting fewer EPUBs or enable `Remove images`."

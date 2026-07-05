@@ -7,12 +7,13 @@ from typing import List, Optional
 import discord
 
 from compiler import compile_selected_epubs
-from config import SESSION_TIMEOUT_SECONDS, has_compile_action_permission
+from config import MAX_EXTERNAL_OUTPUT_EPUB_BYTES, SESSION_TIMEOUT_SECONDS, has_compile_action_permission
 from db import ARCHIVE, move_epub_after, soft_delete_epubs, undelete_epubs
 from epub_tools import (
     disable_view_items, format_bytes, resolve_upload_limit_bytes, safe_default_output_name,
     sanitize_author, sanitize_output_name,
 )
+from external_upload import external_upload_enabled, upload_epub_bytes
 from filter import FilenameFilter
 from models import (
     COMPILE_SEMAPHORE, CompileSession, DEBUG_LOGS, OutputTooLargeError,
@@ -624,6 +625,12 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
         )
 
         upload_limit = resolve_upload_limit_bytes(interaction)
+        can_use_external_upload = external_upload_enabled()
+        compile_limit = (
+            MAX_EXTERNAL_OUTPUT_EPUB_BYTES
+            if can_use_external_upload
+            else upload_limit
+        )
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -634,7 +641,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                     title=output_name,
                     author=sanitize_author(self.session.channel_name),
                     remove_all_images=remove_all_images,
-                    max_output_bytes=upload_limit,
+                    max_output_bytes=compile_limit,
                 )
         except OutputTooLargeError as exc:
             safe_error = safe_log_text(exc, 1900)
@@ -678,6 +685,45 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             message_lines.append("")
             message_lines.append("Skipped source EPUBs:")
             message_lines.extend(f"- {name}: {reason}" for name, reason in skipped)
+
+        if len(output_bytes) > upload_limit and can_use_external_upload:
+            try:
+                download_url = await upload_epub_bytes(
+                    output_bytes,
+                    f"{output_name}.epub",
+                )
+            except Exception as exc:
+                safe_error = safe_log_text(exc, 1500)
+                log_warning(
+                    f"External upload failed for {interaction.user}: {safe_error}"
+                )
+                await interaction.followup.send(
+                    (
+                        "The compiled EPUB is too large for Discord, and external upload failed.\n"
+                        f"Compiled size: {format_bytes(len(output_bytes))}\n"
+                        f"Discord upload limit: {format_bytes(upload_limit)}\n"
+                        f"Error: {safe_error}"
+                    )[:1900],
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
+            message_lines.append("")
+            message_lines.append(
+                f"Compiled size: {format_bytes(len(output_bytes))}"
+            )
+            message_lines.append(f"Download link: {download_url}")
+
+            await interaction.followup.send(
+                "\n".join(message_lines)[:1900],
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log_success(
+                f"{len(selected)} EPUB(s) compiled and uploaded for {interaction.user}"
+            )
+            return
 
         try:
             await interaction.followup.send(
