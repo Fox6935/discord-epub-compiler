@@ -329,6 +329,19 @@ class ArchiveDB:
               finished_at INTEGER CHECK(finished_at IS NULL OR finished_at >= queued_at),
               error_text TEXT
             );
+            CREATE TABLE IF NOT EXISTS guild_config (
+              guild_id INTEGER PRIMARY KEY CHECK(guild_id > 0),
+              special_role_id INTEGER CHECK(special_role_id IS NULL OR special_role_id > 0),
+              updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+              updated_by_user_id INTEGER CHECK(updated_by_user_id IS NULL OR updated_by_user_id > 0)
+            );
+            CREATE TABLE IF NOT EXISTS special_role (
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              role_id INTEGER NOT NULL CHECK(role_id > 0),
+              added_at INTEGER NOT NULL CHECK(added_at >= 0),
+              added_by_user_id INTEGER CHECK(added_by_user_id IS NULL OR added_by_user_id > 0),
+              PRIMARY KEY(guild_id, role_id)
+            );
             CREATE TABLE IF NOT EXISTS import_failure (
               channel_id INTEGER NOT NULL CHECK(channel_id > 0),
               message_id INTEGER NOT NULL CHECK(message_id > 0),
@@ -352,6 +365,15 @@ class ArchiveDB:
             CREATE INDEX IF NOT EXISTS import_failure_channel_idx ON import_failure(channel_id, message_id);
             """
         )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO special_role(guild_id, role_id, added_at, added_by_user_id)
+            SELECT guild_id, special_role_id, updated_at, updated_by_user_id
+            FROM guild_config
+            WHERE special_role_id IS NOT NULL
+            """
+        )
+        conn.execute("UPDATE guild_config SET special_role_id = NULL")
         self._ensure_column_sync(
             conn,
             "epub_version",
@@ -946,6 +968,64 @@ async def watched_categories() -> List[sqlite3.Row]:
             "SELECT * FROM watched_category WHERE guild_id = ? AND watch_enabled = 1",
             (GUILD_ID,),
         ).fetchall()
+    )
+
+
+async def list_special_role_ids() -> List[int]:
+    rows = await ARCHIVE.run(
+        lambda conn: conn.execute(
+            """
+            SELECT role_id
+            FROM special_role
+            WHERE guild_id = ?
+            ORDER BY role_id
+            """,
+            (GUILD_ID,),
+        ).fetchall()
+    )
+    return [row["role_id"] for row in rows]
+
+
+async def add_special_role_id(role_id: int, actor_id: int) -> bool:
+    def sync(conn: sqlite3.Connection) -> bool:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO special_role(guild_id, role_id, added_at, added_by_user_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (GUILD_ID, role_id, unix_now(), actor_id),
+        )
+        return cur.rowcount > 0
+
+    return await ARCHIVE.run(sync)
+
+
+async def delete_special_role_id(role_id: int) -> bool:
+    def sync(conn: sqlite3.Connection) -> bool:
+        cur = conn.execute(
+            """
+            DELETE FROM special_role
+            WHERE guild_id = ? AND role_id = ?
+            """,
+            (GUILD_ID, role_id),
+        )
+        return cur.rowcount > 0
+
+    return await ARCHIVE.run(sync)
+
+
+async def has_compile_action_permission(user: Any) -> bool:
+    perms = getattr(user, "guild_permissions", None)
+    if perms and perms.administrator:
+        return True
+
+    special_role_ids = set(await list_special_role_ids())
+    if not special_role_ids:
+        return False
+
+    return any(
+        getattr(role, "id", None) in special_role_ids
+        for role in getattr(user, "roles", [])
     )
 
 

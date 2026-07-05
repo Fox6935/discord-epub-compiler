@@ -5,10 +5,12 @@ import discord
 from discord import app_commands
 
 from config import (
-    GUILD_ID, TOKEN, bot, get_configured_guild, has_compile_action_permission,
-    is_admin, is_configured_guild,
+    GUILD_ID, TOKEN, bot, get_configured_guild, is_admin, is_configured_guild,
 )
-from db import ARCHIVE, get_watched_channel_row
+from db import (
+    ARCHIVE, add_special_role_id, delete_special_role_id, get_watched_channel_row,
+    has_compile_action_permission, list_special_role_ids,
+)
 from epub_tools import is_epub_attachment
 from ingestion import (
     category_reconcile_loop, cleanup_sessions, enqueue_historical_scan,
@@ -20,17 +22,111 @@ from models import CompileSession, SESSIONS, build_session_key, log, log_success
 from ui import CompileLayoutView
 
 
-@bot.tree.command(name="compile", description="Compile, delete, or reorder archived EPUBs in this channel")
-@app_commands.describe(action="Optional admin action")
+def choice_value(value: object) -> str:
+    if isinstance(value, app_commands.Choice):
+        return str(value.value)
+
+    if value is None:
+        return ""
+
+    return str(value)
+
+
+def parse_role_id(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+
+    text = value.strip()
+
+    if text.startswith("<@&") and text.endswith(">"):
+        text = text[3:-1]
+
+    if not text.isdecimal():
+        return None
+
+    return int(text)
+
+
+async def compile_role_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or not is_configured_guild(interaction.guild):
+        return []
+
+    selected_action = choice_value(getattr(interaction.namespace, "action", None))
+
+    if selected_action not in {"role_add", "role_delete"}:
+        return []
+
+    current = current.lower().strip()
+    configured_ids = set(await list_special_role_ids())
+    choices: list[app_commands.Choice[str]] = []
+
+    if selected_action == "role_delete":
+        role_ids = sorted(configured_ids)
+
+        for role_id in role_ids:
+            guild_role = interaction.guild.get_role(role_id)
+            label = guild_role.name if guild_role is not None else f"Missing role {role_id}"
+
+            if current and current not in label.lower() and current not in str(role_id):
+                continue
+
+            choices.append(
+                app_commands.Choice(
+                    name=label[:100],
+                    value=str(role_id),
+                )
+            )
+
+            if len(choices) >= 25:
+                break
+
+        return choices
+
+    roles = [
+        role
+        for role in interaction.guild.roles
+        if not role.is_default() and role.id not in configured_ids
+    ]
+    roles.sort(key=lambda role: (-role.position, role.name.lower()))
+
+    for guild_role in roles:
+        if current and current not in guild_role.name.lower():
+            continue
+
+        choices.append(
+            app_commands.Choice(
+                name=guild_role.name[:100],
+                value=str(guild_role.id),
+            )
+        )
+
+        if len(choices) >= 25:
+            break
+
+    return choices
+
+
+@bot.tree.command(name="compile", description="Compile or manage archived EPUBs in this channel")
+@app_commands.describe(
+    action="Optional admin action",
+    role="Role to add or delete",
+)
 @app_commands.choices(
     action=[
         app_commands.Choice(name="delete", value="delete"),
         app_commands.Choice(name="reorder", value="reorder"),
+        app_commands.Choice(name="role_add", value="role_add"),
+        app_commands.Choice(name="role_delete", value="role_delete"),
     ]
 )
+@app_commands.autocomplete(role=compile_role_autocomplete)
 async def compile_command(
     interaction: discord.Interaction,
     action: Optional[app_commands.Choice[str]] = None,
+    role: Optional[str] = None,
 ) -> None:
     if interaction.guild is None or interaction.channel is None:
         await interaction.response.send_message(
@@ -49,6 +145,73 @@ async def compile_command(
     selected_action = action.value if action else "select"
     log(f"/compile action={selected_action} run by {interaction.user} in #{channel_name}")
 
+    if selected_action in {"role_add", "role_delete"}:
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "`/compile action:role_add` and `action:role_delete` require Discord Administrator.",
+                ephemeral=True,
+            )
+            return
+
+        role_id = parse_role_id(role)
+
+        if role_id is None:
+            await interaction.response.send_message(
+                "Choose a role from the role autocomplete.",
+                ephemeral=True,
+            )
+            return
+
+        guild_role = interaction.guild.get_role(role_id)
+
+        if selected_action == "role_add":
+            if guild_role is None or guild_role.is_default():
+                await interaction.response.send_message(
+                    "Choose an existing server role.",
+                    ephemeral=True,
+                )
+                return
+
+            added = await add_special_role_id(role_id, interaction.user.id)
+            message = (
+                f"{guild_role.mention} can now use `/compile action:delete` and `/compile action:reorder`."
+                if added
+                else f"{guild_role.mention} is already configured."
+            )
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        deleted = await delete_special_role_id(role_id)
+
+        if guild_role is not None:
+            role_label = guild_role.mention
+        else:
+            role_label = f"`{role_id}`"
+
+        message = (
+            f"{role_label} removed from compile delete/reorder access."
+            if deleted
+            else "That role is not configured."
+        )
+
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if role is not None:
+        await interaction.response.send_message(
+            "Role options are only used with `/compile action:role_add` or `action:role_delete`.",
+            ephemeral=True,
+        )
+        return
+
     if isinstance(interaction.channel, discord.TextChannel):
         me = interaction.guild.me
         if me is not None and not interaction.channel.permissions_for(me).attach_files:
@@ -58,9 +221,9 @@ async def compile_command(
             )
             return
 
-    if selected_action in {"delete", "reorder"} and not has_compile_action_permission(interaction.user):
+    if selected_action in {"delete", "reorder"} and not await has_compile_action_permission(interaction.user):
         await interaction.response.send_message(
-            "You need Administrator or the configured special role for that action.",
+            "You need Administrator or a configured role for that action.",
             ephemeral=True,
         )
         return

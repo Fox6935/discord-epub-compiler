@@ -53,11 +53,10 @@ GUILD_ID=your_discord_server_id
 Optional environment variables:
 
 ```env
-EPUB_ARCHIVE_DB=epub_archive.sqlite3
-SPECIAL_ROLE_ID=role_allowed_to_delete_and_reorder
+EPUB_ARCHIVE_DB=/compileSQL/epub_archive.sqlite3
 ```
 
-`SPECIAL_ROLE_ID` is not an admin role. It only grants access to `/compile action:delete` and `/compile action:reorder`. Discord Administrators can use those actions automatically.
+Delete/reorder access roles are configured with `/compile action:role_add` and `action:role_delete`.
 
 3. Run the bot:
 
@@ -83,12 +82,14 @@ Available to regular users in archived channels.
 - No action: select archived EPUBs and compile them
 - `action:delete`: soft-delete active EPUBs or restore already deleted EPUBs
 - `action:reorder`: move one EPUB between adjacent neighbors
+- `action:role_add role:<role>`: allow that role to use delete/reorder
+- `action:role_delete role:<role>`: remove that role's delete/reorder access
 
-Delete and reorder require Discord Administrator or `SPECIAL_ROLE_ID`.
+`action:role_add` and `action:role_delete` require Discord Administrator. The add list suggests server roles that are not already configured. The delete list suggests only configured roles. Delete and reorder require Discord Administrator or one configured role.
 
 ## Archive Files
 
-By default the archive database is `epub_archive.sqlite3`.
+By default the archive database is `/compileSQL/epub_archive.sqlite3`.
 
 SQLite may also create:
 

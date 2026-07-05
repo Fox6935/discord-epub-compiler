@@ -7,8 +7,11 @@ from typing import List, Optional
 import discord
 
 from compiler import compile_selected_epubs
-from config import MAX_EXTERNAL_OUTPUT_EPUB_BYTES, SESSION_TIMEOUT_SECONDS, has_compile_action_permission
-from db import ARCHIVE, move_epub_after, soft_delete_epubs, undelete_epubs
+from config import MAX_EXTERNAL_OUTPUT_EPUB_BYTES, SESSION_TIMEOUT_SECONDS
+from db import (
+    ARCHIVE, has_compile_action_permission, move_epub_after, soft_delete_epubs,
+    undelete_epubs,
+)
 from epub_tools import (
     disable_view_items, format_bytes, resolve_upload_limit_bytes, safe_default_output_name,
     sanitize_author, sanitize_output_name,
@@ -497,10 +500,10 @@ class CompileLayoutView(discord.ui.LayoutView):
 
         if (
             self.session.flow_mode in {"delete", "reorder_move", "reorder_place"}
-            and not has_compile_action_permission(interaction.user)
+            and not await has_compile_action_permission(interaction.user)
         ):
             await interaction.response.send_message(
-                "You need Administrator or the configured special role.",
+                "You need Administrator or a configured role.",
                 ephemeral=True,
             )
             return False
@@ -820,9 +823,9 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
             )
             return
 
-        if not has_compile_action_permission(interaction.user):
+        if not await has_compile_action_permission(interaction.user):
             await interaction.response.send_message(
-                "You need Administrator or the configured special role.",
+                "You need Administrator or a configured role.",
                 ephemeral=True,
             )
             return

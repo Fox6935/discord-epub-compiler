@@ -12,7 +12,6 @@ DEFAULT_DB_PATH = "/compileSQL/epub_archive.sqlite3"
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", os.environ.get("GUILD_ID", "0")))
 DB_PATH = os.environ.get("EPUB_ARCHIVE_DB", DEFAULT_DB_PATH)
-SPECIAL_ROLE_ID = int(os.environ.get("SPECIAL_ROLE_ID", "0"))
 EXTERNAL_UPLOAD_URL = os.environ.get("api_url", os.environ.get("API_URL", ""))
 EXTERNAL_UPLOAD_KEY = os.environ.get("api_key", os.environ.get("API_KEY", ""))
 
@@ -75,17 +74,3 @@ def get_configured_guild() -> discord.Guild | None:
 def is_admin(interaction: discord.Interaction) -> bool:
     perms = getattr(interaction.user, "guild_permissions", None)
     return bool(perms and perms.administrator)
-
-
-def has_compile_action_permission(user: discord.abc.User) -> bool:
-    perms = getattr(user, "guild_permissions", None)
-    if perms and perms.administrator:
-        return True
-
-    if not SPECIAL_ROLE_ID:
-        return False
-
-    return any(
-        getattr(role, "id", None) == SPECIAL_ROLE_ID
-        for role in getattr(user, "roles", [])
-    )
