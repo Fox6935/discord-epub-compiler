@@ -182,12 +182,61 @@ class ArchiveDB:
             with conn:
                 return func(conn, *args)
 
-    async def bootstrap(self) -> None:
-        db_dir = os.path.dirname(os.path.abspath(self.path))
+    def validate_db_path(self) -> str:
+        if not self.path:
+            raise RuntimeError("SQLite DB path is empty")
+
+        if "\x00" in self.path:
+            raise RuntimeError("SQLite DB path contains a NUL byte")
+
+        absolute_path = os.path.abspath(self.path)
+        db_dir = os.path.dirname(absolute_path)
+
+        if os.path.isdir(absolute_path):
+            raise RuntimeError(f"SQLite DB path is a directory: {absolute_path}")
 
         if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not create SQLite DB directory {db_dir}: {exc}"
+                ) from exc
 
+            if not os.path.isdir(db_dir):
+                raise RuntimeError(
+                    f"SQLite DB parent path is not a directory: {db_dir}"
+                )
+
+        if os.path.exists(absolute_path):
+            if not os.path.isfile(absolute_path):
+                raise RuntimeError(
+                    f"SQLite DB path exists but is not a regular file: {absolute_path}"
+                )
+
+            try:
+                with open(absolute_path, "ab"):
+                    pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"SQLite DB file is not writable: {absolute_path}: {exc}"
+                ) from exc
+        else:
+            try:
+                with open(absolute_path, "xb"):
+                    pass
+                os.remove(absolute_path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not create SQLite DB file at {absolute_path}: {exc}"
+                ) from exc
+
+        return absolute_path
+
+    async def bootstrap(self) -> None:
+        self.path = self.validate_db_path()
         new_db = not os.path.exists(self.path)
         await self.run(self._bootstrap_sync, new_db)
 
