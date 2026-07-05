@@ -186,52 +186,22 @@ class ArchiveDB:
         if not self.path:
             raise RuntimeError("SQLite DB path is empty")
 
-        if "\x00" in self.path:
-            raise RuntimeError("SQLite DB path contains a NUL byte")
-
         absolute_path = os.path.abspath(self.path)
         db_dir = os.path.dirname(absolute_path)
 
         if os.path.isdir(absolute_path):
             raise RuntimeError(f"SQLite DB path is a directory: {absolute_path}")
 
-        if db_dir:
-            try:
-                os.makedirs(db_dir, exist_ok=True)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Could not create SQLite DB directory {db_dir}: {exc}"
-                ) from exc
-
-            if not os.path.isdir(db_dir):
-                raise RuntimeError(
-                    f"SQLite DB parent path is not a directory: {db_dir}"
-                )
-
         if os.path.exists(absolute_path):
-            if not os.path.isfile(absolute_path):
-                raise RuntimeError(
-                    f"SQLite DB path exists but is not a regular file: {absolute_path}"
-                )
+            return absolute_path
 
-            try:
-                with open(absolute_path, "ab"):
-                    pass
-            except OSError as exc:
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+            if not os.access(db_dir, os.W_OK):
                 raise RuntimeError(
-                    f"SQLite DB file is not writable: {absolute_path}: {exc}"
-                ) from exc
-        else:
-            try:
-                with open(absolute_path, "xb"):
-                    pass
-                os.remove(absolute_path)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Could not create SQLite DB file at {absolute_path}: {exc}"
-                ) from exc
+                    f"SQLite DB directory is not writable: {db_dir}"
+                )
 
         return absolute_path
 
