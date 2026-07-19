@@ -16,7 +16,11 @@ The bot imports EPUBs as messages arrive and during watched-channel backfills. C
 - Compiles selected archived EPUBs in chronological reading order
 - Automatically skips covers, TOCs, title pages, and non-chapter content
 - Preserves referenced inline images, with an option to remove all images
-- Admin/special-role delete and reorder flows
+- Administrator/configured-role delete and reorder flows
+- Administrator settings modal for compile-action roles and archive-failure alert roles
+- Batched in-channel archive-failure alerts with a 15-second per-channel debounce
+- Verified SHA-256 checksums for retained EPUB components and archives
+- Destructive, confirmation-gated channel rescans
 - Soft delete support, including restore from the delete menu
 - Reorder support using neighbor placement
 
@@ -56,7 +60,8 @@ Optional environment variables:
 EPUB_ARCHIVE_DB=/compileSQL/epub_archive.sqlite3
 ```
 
-Delete/reorder access roles are configured with `/compile action:role_add` and `action:role_delete`.
+Delete/reorder roles and archive-failure alert roles are configured with
+`/compile action:settings`.
 
 3. Run the bot:
 
@@ -82,10 +87,39 @@ Available to regular users in archived channels.
 - `/compile` No action: select archived EPUBs and compile them
 - `/compile action:delete`: soft-delete active EPUBs or restore already deleted EPUBs
 - `/compile action:reorder`: move one EPUB between adjacent neighbors
-- `/compile action:role_add`: open a role picker to grant delete/reorder access
-- `/compile action:role_delete`: open a configured-role picker to remove delete/reorder access
+- `/compile action:settings`: open an Administrator-only modal for compile-action roles and
+  archive-failure alert roles
+Saved entries are preselected; deselecting them removes access or notifications.
+Delete and reorder require Discord Administrator or one configured role.
 
-`action:role_add` and `action:role_delete` require Discord Administrator. Delete and reorder require Discord Administrator or a configured role.
+### `/rescan`
+
+Requires Discord Administrator and an actively watched channel.
+
+The command opens an ephemeral confirmation. Confirming permanently deletes that
+channel's archived EPUBs, history, custom ordering, scan cursors, and
+import failures from SQLite, then queues a full scan of Discord history. It never
+deletes Discord messages or attachments. Files no longer present in Discord cannot
+be recovered.
+
+If the same channel is already scanning, that scan is cancelled and restarted.
+If another channel is scanning, the rescan waits in the queue.
+
+### Archive failure notifications
+
+After an EPUB fails to archive, the configured roles are mentioned in that channel
+after 15 seconds of quiet time. Additional failures reset the delay. Finishing a
+channel scan flushes its pending failures immediately. Messages are formatted as:
+
+```text
+@Role
+Archive Failed: Filename1.epub
+Archive Failed: Filename2.epub
+```
+
+Long batches are split to respect Discord's 2,000-character message limit, with the
+role mentions repeated in each message. An unresolved failure is marked notified
+only after its channel message is sent successfully.
 
 ## Archive Files
 
@@ -105,6 +139,11 @@ Keep all three files together while the bot is running. They are normal SQLite s
 - Live ingestion depends on Message Content Intent so Discord includes attachment metadata in message events.
 - Deleted EPUBs are soft-deleted and can be restored from `/compile action:delete`.
 - Reorder is blocked until a channel's historical scan is complete.
+- View Channel and Read Message History are required to archive a watched channel.
+- Missing Send Messages or Attach Files is reported when watching/rescanning and at
+  startup. Archiving may continue, but compilation delivery remains blocked.
+- Stored EPUB content is verified using per-component SHA-256 hashes and an aggregate
+  checksum over the retained archive components.
 
 ## License
 

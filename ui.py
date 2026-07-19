@@ -13,11 +13,12 @@ from db import (
     undelete_epubs,
 )
 from epub_tools import (
-    disable_view_items, format_bytes, resolve_upload_limit_bytes, safe_default_output_name,
+    default_output_name, disable_view_items, format_bytes, resolve_upload_limit_bytes,
     sanitize_author, sanitize_output_name,
 )
 from external_upload import external_upload_enabled, upload_epub_bytes
 from filter import FilenameFilter
+from ingestion import is_channel_in_maintenance
 from models import (
     COMPILE_SEMAPHORE, CompileSession, DEBUG_LOGS, OutputTooLargeError,
     is_session_live, log, log_success, log_warning, safe_log_text,
@@ -45,27 +46,27 @@ def format_compact_estimate(size: int) -> str:
 
 
 async def ensure_selected_image_sizes(session: CompileSession) -> None:
-    version_ids = [
-        entry.epub_version_id
+    archive_ids = [
+        entry.archive_id
         for entry in session.entries
         if entry.entry_id in session.selected_ids
-        and entry.epub_version_id not in session.loaded_image_version_ids
+        and entry.archive_id not in session.loaded_image_archive_ids
     ]
 
-    if not version_ids:
+    if not archive_ids:
         return
 
-    sizes_by_version = await ARCHIVE.output_image_sizes(version_ids)
+    sizes_by_archive = await ARCHIVE.output_image_sizes(archive_ids)
 
     for entry in session.entries:
-        if entry.epub_version_id not in version_ids:
+        if entry.archive_id not in archive_ids:
             continue
 
-        image_blob_sizes = tuple(sizes_by_version.get(entry.epub_version_id, []))
+        image_blob_sizes = tuple(sizes_by_archive.get(entry.archive_id, []))
         entry.image_blob_sizes = image_blob_sizes
         entry.estimated_image_bytes = sum(size for _, size in image_blob_sizes)
 
-    session.loaded_image_version_ids.update(version_ids)
+    session.loaded_image_archive_ids.update(archive_ids)
 
 
 class EpubPickerSelect(discord.ui.Select):
@@ -491,6 +492,13 @@ class CompileLayoutView(discord.ui.LayoutView):
             )
             return False
 
+        if is_channel_in_maintenance(self.session.channel_id):
+            await interaction.response.send_message(
+                "This channel's archive is being reset.",
+                ephemeral=True,
+            )
+            return False
+
         if not is_session_live(self.session):
             await interaction.response.send_message(
                 "This compile session expired. Run `/compile` again.",
@@ -577,16 +585,15 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
     output_name = discord.ui.TextInput(
         label="Output name",
         placeholder="Example: My Compiled Book",
-        min_length=1,
         max_length=120,
-        required=True,
+        required=False,
     )
 
     def __init__(self, session: CompileSession):
         super().__init__(timeout=300)
 
         self.session = session
-        self.output_name.default = safe_default_output_name(session.channel_name)
+        self.output_name.default = default_output_name(session.channel_name)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.session.user_id:
@@ -603,11 +610,10 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
             )
             return
 
-        try:
-            output_name = sanitize_output_name(str(self.output_name))
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
+        output_name = sanitize_output_name(
+            str(self.output_name),
+            default_output_name(self.session.channel_name),
+        )
 
         async with self.session.lock:
             self.session.touch()
@@ -836,12 +842,12 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
             if entry.entry_id in self.session.selected_ids
         ]
         delete_ids = [
-            entry.discord_epub_id
+            entry.archive_id
             for entry in selected_entries
             if not entry.is_deleted
         ]
         undelete_ids = [
-            entry.discord_epub_id
+            entry.archive_id
             for entry in selected_entries
             if entry.is_deleted
         ]
@@ -862,7 +868,7 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
             include_deleted=True,
         )
         self.session.selected_ids.clear()
-        self.session.loaded_image_version_ids.clear()
+        self.session.loaded_image_archive_ids.clear()
         self.session.touch()
 
         await interaction.response.edit_message(view=CompileLayoutView(self.session))
@@ -919,7 +925,7 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
             if ordered and only.entry_id == ordered[0].entry_id:
                 target_id = None
             elif ordered and only.entry_id == ordered[-1].entry_id:
-                target_id = only.discord_epub_id
+                target_id = only.archive_id
             else:
                 await interaction.response.send_message(
                     "A single placement selection is only valid for the first or last position.",
@@ -937,11 +943,11 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
                 )
                 return
 
-            target_id = first.discord_epub_id
+            target_id = first.archive_id
 
         await move_epub_after(
             session.channel_id,
-            moving_entry.discord_epub_id,
+            moving_entry.archive_id,
             target_id,
         )
         session.entries = await ARCHIVE.list_channel_epubs(
@@ -951,7 +957,7 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
         session.selected_ids.clear()
         session.placement_ids.clear()
         session.reorder_moving_id = None
-        session.loaded_image_version_ids.clear()
+        session.loaded_image_archive_ids.clear()
         session.flow_mode = "reorder_move"
         session.current_page = 0
         session.touch()

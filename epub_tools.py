@@ -16,7 +16,7 @@ from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
 from config import (
-    ALLOWED_NAME_RE, CONTAINER_NS, DEFAULT_UPLOAD_LIMIT_BYTES,
+    CONTAINER_NS, DEFAULT_UPLOAD_LIMIT_BYTES, ILLEGAL_OUTPUT_NAME_RE,
     EPUB_BASE_OVERHEAD_BYTES, EPUB_EXT_RE, EPUB_NS, EPUB_PER_CHAPTER_OVERHEAD_BYTES,
     EPUB_PER_IMAGE_OVERHEAD_BYTES, MAX_SINGLE_FILE_UNCOMPRESSED_BYTES,
     MAX_SOURCE_UNCOMPRESSED_BYTES, MAX_ZIP_MEMBERS, SAFE_FILE_RE, SAFE_META_RE,
@@ -85,26 +85,18 @@ def local_name(tag: str) -> str:
     return tag
 
 
-def sanitize_output_name(raw: str) -> str:
-    raw = raw.strip().strip(".")
-    if not raw:
-        return "compiled"
+def sanitize_output_name(raw: str, default_name: str) -> str:
+    def clean(value: str) -> str:
+        value = (value or "").strip().strip(".")
+        return ILLEGAL_OUTPUT_NAME_RE.sub("_", value)[:120].strip().strip(".")
 
-    if not ALLOWED_NAME_RE.fullmatch(raw):
-        raise ValueError(
-            "Only letters, numbers, spaces, dash, underscore, comma, "
-            "period, apostrophe, and parentheses are allowed."
-        )
-
-    return raw[:120] or "compiled"
+    return clean(raw) or clean(default_name) or "compiled"
 
 
-def safe_default_output_name(raw: str) -> str:
-    try:
-        return sanitize_output_name(raw)
-    except ValueError:
-        clean = SAFE_FILE_RE.sub("_", raw or "").strip("._ ")
-        return clean[:120] or "compiled"
+def default_output_name(channel_name: str) -> str:
+    words = (channel_name or "").replace("-", " ").split()
+    titled = " ".join(word[:1].upper() + word[1:] for word in words)
+    return sanitize_output_name(titled, "compiled")
 
 
 def sanitize_author(raw: str) -> str:
@@ -295,6 +287,7 @@ def safe_zip_read(zf: zipfile.ZipFile, name: str) -> bytes:
 
 def validate_zip_member_names(zf: zipfile.ZipFile) -> None:
     members = zf.infolist()
+    normalized_names: Set[str] = set()
 
     if len(members) > MAX_ZIP_MEMBERS:
         raise ValueError("EPUB has too many files")
@@ -312,6 +305,10 @@ def validate_zip_member_names(zf: zipfile.ZipFile) -> None:
 
         if any(part == ".." for part in parts):
             raise ValueError(f"Unsafe EPUB path traversal: {info.filename}")
+
+        if name in normalized_names:
+            raise ValueError(f"Duplicate EPUB path: {info.filename}")
+        normalized_names.add(name)
 
 
 def validate_zip_sizes(zf: zipfile.ZipFile) -> None:

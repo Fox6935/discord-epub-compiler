@@ -22,6 +22,10 @@ class OutputTooLargeError(ValueError):
     pass
 
 
+class ArchiveIntegrityError(ValueError):
+    pass
+
+
 DEBUG_LOGS = os.getenv("DEBUG_LOGS", "").lower() in {"1", "true", "yes", "on"}
 USE_COLOR = sys.stdout.isatty() and not os.getenv("NO_COLOR")
 USE_PROGRESS = sys.stdout.isatty()
@@ -184,8 +188,7 @@ def now_utc() -> datetime:
 @dataclass
 class EpubEntry:
     entry_id: str
-    discord_epub_id: int
-    epub_version_id: int
+    archive_id: int
     channel_id: int
     message_id: int
     attachment_index: int
@@ -212,7 +215,7 @@ class CompileSession:
     flow_mode: str = "compile"
     reorder_moving_id: Optional[str] = None
     filename_filter: FilenameFilter = field(default_factory=FilenameFilter)
-    loaded_image_version_ids: Set[int] = field(default_factory=set)
+    loaded_image_archive_ids: Set[int] = field(default_factory=set)
     remove_all_images: bool = False
     expired: bool = False
     created_at: datetime = field(default_factory=now_utc)

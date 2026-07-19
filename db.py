@@ -4,7 +4,6 @@ import hashlib
 import io
 import os
 import posixpath
-import re
 import sqlite3
 import zlib
 import zipfile
@@ -13,11 +12,11 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from config import DB_PATH, GUILD_ID
 from epub_tools import (
-    extract_book_content, find_container_rootfile, get_text_content, guess_media_type,
+    extract_book_content, find_container_rootfile, guess_media_type,
     local_name, parse_opf, parse_xml, raw_deflate_size, safe_zip_read, validate_epub_basics,
     validate_zip_member_names, validate_zip_sizes,
 )
-from models import EpubEntry
+from models import ArchiveIntegrityError, EpubEntry
 
 
 def unix_now() -> int:
@@ -32,13 +31,6 @@ def dt_to_unix(dt: datetime) -> int:
 
 def unix_to_dt(value: int) -> datetime:
     return datetime.fromtimestamp(value, timezone.utc)
-
-
-def normalize_key(raw: str) -> str:
-    raw = re.sub(r"\b(ch|chapter|chapters)\s*\d+([\s._-]*(to|-)\s*\d+)?\b", "", raw, flags=re.I)
-    raw = re.sub(r"\bv\d+\b", "", raw, flags=re.I)
-    raw = re.sub(r"\.epub$", "", raw, flags=re.I)
-    return re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip() or "unknown"
 
 
 def validate_internal_zip_path(path: str) -> str:
@@ -102,29 +94,22 @@ def load_blob_payload(compression: str, data: bytes) -> bytes:
 
 def parse_opf_metadata_from_zip(
     zf: zipfile.ZipFile,
-) -> Tuple[str, str, Dict[str, str], Dict[str, int], Set[str]]:
+) -> Tuple[Dict[str, str], Dict[str, int], Set[str]]:
     manifest_types: Dict[str, str] = {}
     spine_orders: Dict[str, int] = {}
     cover_image_paths: Set[str] = set()
-    title = ""
-    creator = ""
-
     try:
         opf_path = find_container_rootfile(zf)
         opf_dir, manifest, spine, _ = parse_opf(zf, opf_path)
         root = parse_xml(safe_zip_read(zf, opf_path))
     except Exception:
-        return title, creator, manifest_types, spine_orders, cover_image_paths
+        return manifest_types, spine_orders, cover_image_paths
 
     cover_item_ids: Set[str] = set()
 
     for elem in root.iter():
         lname = local_name(elem.tag).lower()
-        if lname == "title" and not title:
-            title = get_text_content(elem)
-        elif lname in {"creator", "author"} and not creator:
-            creator = get_text_content(elem)
-        elif lname == "meta" and (elem.get("name") or "").lower() == "cover":
+        if lname == "meta" and (elem.get("name") or "").lower() == "cover":
             content = elem.get("content")
 
             if content:
@@ -147,15 +132,16 @@ def parse_opf_metadata_from_zip(
         if item:
             spine_orders[item["href"]] = index
 
-    return title, creator, manifest_types, spine_orders, cover_image_paths
+    return manifest_types, spine_orders, cover_image_paths
 
 
-def compute_epub_fingerprint(components: List[Tuple[str, bytes]]) -> bytes:
+def compute_archive_checksum(components: Iterable[Tuple[str, bytes]]) -> bytes:
     outer = hashlib.sha256()
 
     for internal_path, blob_hash in sorted(components, key=lambda item: item[0]):
-        outer.update(internal_path.encode("utf-8"))
-        outer.update(b"\x00")
+        path_bytes = internal_path.encode("utf-8")
+        outer.update(len(path_bytes).to_bytes(4, "big"))
+        outer.update(path_bytes)
         outer.update(blob_hash)
 
     return outer.digest()
@@ -211,6 +197,26 @@ class ArchiveDB:
         await self.run(self._bootstrap_sync, new_db)
 
     def _bootstrap_sync(self, conn: sqlite3.Connection, new_db: bool) -> None:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        legacy_tables = {
+            "book", "epub_version", "discord_epub", "scan_job",
+            "guild_config", "special_role", "archive_failure_recipient",
+        }
+        found_legacy = sorted(existing_tables & legacy_tables)
+
+        if found_legacy:
+            names = ", ".join(found_legacy)
+            raise RuntimeError(
+                "Incompatible testing database schema found "
+                f"({names}). Stop the bot, delete the SQLite database and its "
+                "-wal/-shm sidecars, then restart to rescan Discord."
+            )
+
         if new_db:
             conn.execute("PRAGMA page_size=32768")
             conn.execute("VACUUM")
@@ -219,22 +225,26 @@ class ArchiveDB:
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS book (
+            CREATE TABLE IF NOT EXISTS archived_epub (
               id INTEGER PRIMARY KEY,
-              canonical_key TEXT,
-              first_seen_at INTEGER NOT NULL CHECK(first_seen_at >= 0)
-            );
-            CREATE TABLE IF NOT EXISTS epub_version (
-              id INTEGER PRIMARY KEY,
-              book_id INTEGER,
-              original_filename TEXT NOT NULL CHECK(length(original_filename) > 0),
-              imported_at INTEGER NOT NULL CHECK(imported_at >= 0),
-              source_size INTEGER CHECK(source_size IS NULL OR source_size >= 0),
-              epub_fingerprint BLOB CHECK(epub_fingerprint IS NULL OR length(epub_fingerprint) = 32),
-              component_count INTEGER CHECK(component_count IS NULL OR component_count >= 0),
+              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+              channel_id INTEGER NOT NULL CHECK(channel_id > 0),
+              message_id INTEGER NOT NULL CHECK(message_id > 0),
+              attachment_index INTEGER NOT NULL CHECK(attachment_index >= 0),
+              filename TEXT NOT NULL CHECK(length(filename) > 0),
+              attachment_size INTEGER CHECK(attachment_size IS NULL OR attachment_size >= 0),
+              message_created_at INTEGER NOT NULL CHECK(message_created_at >= 0),
+              archive_checksum BLOB NOT NULL CHECK(length(archive_checksum) = 32),
+              component_count INTEGER NOT NULL CHECK(component_count > 0),
               estimated_compiled_chapter_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_compiled_chapter_bytes >= 0),
               estimated_compiled_chapter_count INTEGER NOT NULL DEFAULT 0 CHECK(estimated_compiled_chapter_count >= 0),
-              FOREIGN KEY(book_id) REFERENCES book(id)
+              effective_order INTEGER NOT NULL CHECK(effective_order >= 0),
+              is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+              deleted_at INTEGER CHECK(deleted_at IS NULL OR deleted_at >= 0),
+              deleted_by_user_id INTEGER CHECK(deleted_by_user_id IS NULL OR deleted_by_user_id > 0),
+              delete_reason TEXT,
+              created_at INTEGER NOT NULL CHECK(created_at >= 0),
+              UNIQUE(guild_id, channel_id, message_id, attachment_index)
             );
             CREATE TABLE IF NOT EXISTS blob (
               hash BLOB PRIMARY KEY CHECK(length(hash) = 32),
@@ -247,7 +257,7 @@ class ArchiveDB:
               first_seen_at INTEGER NOT NULL CHECK(first_seen_at >= 0)
             );
             CREATE TABLE IF NOT EXISTS epub_component (
-              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
+              archived_epub_id INTEGER NOT NULL CHECK(archived_epub_id > 0),
               internal_path TEXT NOT NULL CHECK(
                 length(internal_path) > 0
                 AND internal_path NOT LIKE '/%'
@@ -262,36 +272,18 @@ class ArchiveDB:
               spine_order INTEGER CHECK(spine_order IS NULL OR spine_order > 0),
               is_manifest_item INTEGER NOT NULL DEFAULT 1 CHECK(is_manifest_item IN (0, 1)),
               is_cover_image INTEGER NOT NULL DEFAULT 0 CHECK(is_cover_image IN (0, 1)),
-              PRIMARY KEY(epub_version_id, internal_path),
-              FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
+              PRIMARY KEY(archived_epub_id, internal_path),
+              FOREIGN KEY(archived_epub_id) REFERENCES archived_epub(id) ON DELETE CASCADE,
               FOREIGN KEY(blob_hash) REFERENCES blob(hash)
             );
             CREATE TABLE IF NOT EXISTS epub_output_image (
-              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
+              archived_epub_id INTEGER NOT NULL CHECK(archived_epub_id > 0),
               blob_hash BLOB NOT NULL CHECK(length(blob_hash) = 32),
               size_uncompressed INTEGER NOT NULL CHECK(size_uncompressed >= 0),
               estimated_stored_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_stored_bytes >= 0),
-              PRIMARY KEY(epub_version_id, blob_hash),
-              FOREIGN KEY(epub_version_id) REFERENCES epub_version(id),
+              PRIMARY KEY(archived_epub_id, blob_hash),
+              FOREIGN KEY(archived_epub_id) REFERENCES archived_epub(id) ON DELETE CASCADE,
               FOREIGN KEY(blob_hash) REFERENCES blob(hash)
-            );
-            CREATE TABLE IF NOT EXISTS discord_epub (
-              id INTEGER PRIMARY KEY,
-              guild_id INTEGER NOT NULL CHECK(guild_id > 0),
-              channel_id INTEGER NOT NULL CHECK(channel_id > 0),
-              message_id INTEGER NOT NULL CHECK(message_id > 0),
-              attachment_index INTEGER NOT NULL CHECK(attachment_index >= 0),
-              discord_filename TEXT NOT NULL CHECK(length(discord_filename) > 0),
-              attachment_size INTEGER CHECK(attachment_size IS NULL OR attachment_size >= 0),
-              message_created_at INTEGER NOT NULL CHECK(message_created_at >= 0),
-              epub_version_id INTEGER NOT NULL CHECK(epub_version_id > 0),
-              effective_order INTEGER NOT NULL CHECK(effective_order >= 0),
-              is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
-              deleted_at INTEGER CHECK(deleted_at IS NULL OR deleted_at >= 0),
-              deleted_by_user_id INTEGER CHECK(deleted_by_user_id IS NULL OR deleted_by_user_id > 0),
-              delete_reason TEXT,
-              created_at INTEGER NOT NULL CHECK(created_at >= 0),
-              FOREIGN KEY(epub_version_id) REFERENCES epub_version(id)
             );
             CREATE TABLE IF NOT EXISTS watched_channel (
               channel_id INTEGER PRIMARY KEY CHECK(channel_id > 0),
@@ -306,6 +298,7 @@ class ArchiveDB:
               last_scan_started_at INTEGER CHECK(last_scan_started_at IS NULL OR last_scan_started_at >= 0),
               last_scan_finished_at INTEGER CHECK(last_scan_finished_at IS NULL OR last_scan_finished_at >= 0),
               last_catchup_completed_at INTEGER CHECK(last_catchup_completed_at IS NULL OR last_catchup_completed_at >= 0),
+              archive_generation INTEGER NOT NULL DEFAULT 1 CHECK(archive_generation > 0),
               last_error TEXT
             );
             CREATE TABLE IF NOT EXISTS watched_category (
@@ -316,26 +309,14 @@ class ArchiveDB:
               last_reconciled_at INTEGER CHECK(last_reconciled_at IS NULL OR last_reconciled_at >= 0),
               last_error TEXT
             );
-            CREATE TABLE IF NOT EXISTS scan_job (
-              id INTEGER PRIMARY KEY,
-              scope_type TEXT NOT NULL CHECK(scope_type IN ('channel', 'category')),
+            CREATE TABLE IF NOT EXISTS compile_action_role (
               guild_id INTEGER NOT NULL CHECK(guild_id > 0),
-              category_id INTEGER CHECK(category_id IS NULL OR category_id > 0),
-              channel_id INTEGER CHECK(channel_id IS NULL OR channel_id > 0),
-              requested_by_user_id INTEGER NOT NULL CHECK(requested_by_user_id > 0),
-              status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'complete', 'failed')),
-              queued_at INTEGER NOT NULL CHECK(queued_at >= 0),
-              started_at INTEGER CHECK(started_at IS NULL OR started_at >= queued_at),
-              finished_at INTEGER CHECK(finished_at IS NULL OR finished_at >= queued_at),
-              error_text TEXT
+              role_id INTEGER NOT NULL CHECK(role_id > 0),
+              added_at INTEGER NOT NULL CHECK(added_at >= 0),
+              added_by_user_id INTEGER CHECK(added_by_user_id IS NULL OR added_by_user_id > 0),
+              PRIMARY KEY(guild_id, role_id)
             );
-            CREATE TABLE IF NOT EXISTS guild_config (
-              guild_id INTEGER PRIMARY KEY CHECK(guild_id > 0),
-              special_role_id INTEGER CHECK(special_role_id IS NULL OR special_role_id > 0),
-              updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-              updated_by_user_id INTEGER CHECK(updated_by_user_id IS NULL OR updated_by_user_id > 0)
-            );
-            CREATE TABLE IF NOT EXISTS special_role (
+            CREATE TABLE IF NOT EXISTS archive_failure_role (
               guild_id INTEGER NOT NULL CHECK(guild_id > 0),
               role_id INTEGER NOT NULL CHECK(role_id > 0),
               added_at INTEGER NOT NULL CHECK(added_at >= 0),
@@ -347,61 +328,23 @@ class ArchiveDB:
               message_id INTEGER NOT NULL CHECK(message_id > 0),
               attachment_index INTEGER NOT NULL CHECK(attachment_index >= 0),
               guild_id INTEGER NOT NULL CHECK(guild_id > 0),
-              filename TEXT,
+              filename TEXT NOT NULL CHECK(length(filename) > 0),
               error_text TEXT NOT NULL CHECK(length(error_text) > 0),
               first_failed_at INTEGER NOT NULL CHECK(first_failed_at >= 0),
               last_failed_at INTEGER NOT NULL CHECK(last_failed_at >= first_failed_at),
               attempt_count INTEGER NOT NULL CHECK(attempt_count > 0),
+              notified_at INTEGER CHECK(notified_at IS NULL OR notified_at >= first_failed_at),
               PRIMARY KEY(channel_id, message_id, attachment_index)
             );
-            CREATE INDEX IF NOT EXISTS epub_version_filename_idx ON epub_version(original_filename);
             CREATE INDEX IF NOT EXISTS epub_component_blob_idx ON epub_component(blob_hash);
-            CREATE INDEX IF NOT EXISTS epub_component_version_idx ON epub_component(epub_version_id);
-            CREATE INDEX IF NOT EXISTS epub_output_image_version_idx ON epub_output_image(epub_version_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS discord_epub_unique_idx ON discord_epub(channel_id, message_id, attachment_index);
-            CREATE INDEX IF NOT EXISTS discord_epub_channel_effective_order_idx ON discord_epub(channel_id, is_deleted, effective_order);
+            CREATE INDEX IF NOT EXISTS epub_component_archive_idx ON epub_component(archived_epub_id);
+            CREATE INDEX IF NOT EXISTS epub_output_image_archive_idx ON epub_output_image(archived_epub_id);
+            CREATE INDEX IF NOT EXISTS archived_epub_channel_order_idx ON archived_epub(channel_id, is_deleted, effective_order);
             CREATE INDEX IF NOT EXISTS watched_channel_watch_idx ON watched_channel(watch_enabled, historical_scan_complete);
             CREATE INDEX IF NOT EXISTS watched_category_watch_idx ON watched_category(watch_enabled);
             CREATE INDEX IF NOT EXISTS import_failure_channel_idx ON import_failure(channel_id, message_id);
             """
         )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO special_role(guild_id, role_id, added_at, added_by_user_id)
-            SELECT guild_id, special_role_id, updated_at, updated_by_user_id
-            FROM guild_config
-            WHERE special_role_id IS NOT NULL
-            """
-        )
-        conn.execute("UPDATE guild_config SET special_role_id = NULL")
-        self._ensure_column_sync(
-            conn,
-            "epub_version",
-            "estimated_compiled_chapter_bytes",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        self._ensure_column_sync(
-            conn,
-            "epub_version",
-            "estimated_compiled_chapter_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        self._ensure_column_sync(
-            conn,
-            "epub_output_image",
-            "estimated_stored_bytes",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        added_cover_column = self._ensure_column_sync(
-            conn,
-            "epub_component",
-            "is_cover_image",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-
-        if added_cover_column:
-            self._backfill_cover_image_flags_sync(conn)
-
         self._check_integrity_sync(conn)
 
     def _check_integrity_sync(self, conn: sqlite3.Connection) -> None:
@@ -416,49 +359,6 @@ class ArchiveDB:
         if foreign_key_errors:
             raise RuntimeError("SQLite foreign key check failed")
 
-    def _ensure_column_sync(
-        self,
-        conn: sqlite3.Connection,
-        table: str,
-        column: str,
-        definition: str,
-    ) -> bool:
-        columns = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-
-        if column in columns:
-            return False
-
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        return True
-
-    def _backfill_cover_image_flags_sync(self, conn: sqlite3.Connection) -> None:
-        version_rows = conn.execute("SELECT id FROM epub_version").fetchall()
-
-        for row in version_rows:
-            try:
-                epub_bytes = self._reconstruct_epub_sync(conn, row["id"])
-
-                with zipfile.ZipFile(io.BytesIO(epub_bytes), "r") as zf:
-                    _, _, _, _, cover_image_paths = parse_opf_metadata_from_zip(zf)
-            except Exception:
-                continue
-
-            if not cover_image_paths:
-                continue
-
-            placeholders = ",".join("?" for _ in cover_image_paths)
-            conn.execute(
-                f"""
-                UPDATE epub_component
-                SET is_cover_image = 1
-                WHERE epub_version_id = ? AND internal_path IN ({placeholders})
-                """,
-                [row["id"], *cover_image_paths],
-            )
-
     async def list_channel_epubs(
         self,
         channel_id: int,
@@ -470,20 +370,20 @@ class ArchiveDB:
             include_deleted,
         )
 
-    async def is_discord_epub_imported(
+    async def is_attachment_archived(
         self,
         channel_id: int,
         message_id: int,
         attachment_index: int,
     ) -> bool:
         return await self.run(
-            self._is_discord_epub_imported_sync,
+            self._is_attachment_archived_sync,
             channel_id,
             message_id,
             attachment_index,
         )
 
-    def _is_discord_epub_imported_sync(
+    def _is_attachment_archived_sync(
         self,
         conn: sqlite3.Connection,
         channel_id: int,
@@ -493,7 +393,7 @@ class ArchiveDB:
         return (
             conn.execute(
                 """
-                SELECT 1 FROM discord_epub
+                SELECT 1 FROM archived_epub
                 WHERE channel_id = ? AND message_id = ? AND attachment_index = ?
                 """,
                 (channel_id, message_id, attachment_index),
@@ -511,22 +411,13 @@ class ArchiveDB:
         rows = conn.execute(
             f"""
             SELECT
-              d.id,
-              d.channel_id,
-              d.message_id,
-              d.attachment_index,
-              d.discord_filename,
-              d.attachment_size,
-              d.message_created_at,
-              d.epub_version_id,
-              d.effective_order,
-              d.is_deleted,
-              v.estimated_compiled_chapter_bytes AS estimated_chapter_bytes,
-              v.estimated_compiled_chapter_count AS estimated_chapter_count
-            FROM discord_epub d
-            JOIN epub_version v ON v.id = d.epub_version_id
-            WHERE d.guild_id = ? AND d.channel_id = ? {deleted_filter}
-            ORDER BY d.effective_order DESC
+              id, channel_id, message_id, attachment_index, filename,
+              attachment_size, message_created_at, effective_order, is_deleted,
+              estimated_compiled_chapter_bytes AS estimated_chapter_bytes,
+              estimated_compiled_chapter_count AS estimated_chapter_count
+            FROM archived_epub
+            WHERE guild_id = ? AND channel_id = ? {deleted_filter}
+            ORDER BY effective_order DESC
             """,
             (GUILD_ID, channel_id),
         ).fetchall()
@@ -534,12 +425,11 @@ class ArchiveDB:
         return [
             EpubEntry(
                 entry_id=str(row["id"]),
-                discord_epub_id=row["id"],
-                epub_version_id=row["epub_version_id"],
+                archive_id=row["id"],
                 channel_id=row["channel_id"],
                 message_id=row["message_id"],
                 attachment_index=row["attachment_index"],
-                filename=row["discord_filename"],
+                filename=row["filename"],
                 attachment_size=row["attachment_size"],
                 created_at=unix_to_dt(row["message_created_at"]),
                 effective_order=row["effective_order"],
@@ -552,9 +442,9 @@ class ArchiveDB:
 
     async def output_image_sizes(
         self,
-        epub_version_ids: Iterable[int],
+        archive_ids: Iterable[int],
     ) -> Dict[int, List[Tuple[str, int]]]:
-        clean_ids = sorted({int(value) for value in epub_version_ids})
+        clean_ids = sorted({int(value) for value in archive_ids})
 
         if not clean_ids:
             return {}
@@ -564,13 +454,13 @@ class ArchiveDB:
     def _output_image_sizes_sync(
         self,
         conn: sqlite3.Connection,
-        epub_version_ids: List[int],
+        archive_ids: List[int],
     ) -> Dict[int, List[Tuple[str, int]]]:
-        placeholders = ",".join("?" for _ in epub_version_ids)
+        placeholders = ",".join("?" for _ in archive_ids)
         rows = conn.execute(
             f"""
             SELECT
-              epub_version_id,
+              archived_epub_id,
               hex(blob_hash) AS blob_hash,
               MAX(
                 CASE
@@ -579,48 +469,70 @@ class ArchiveDB:
                 END
               ) AS estimated_stored_bytes
             FROM epub_output_image
-            WHERE epub_version_id IN ({placeholders})
-            GROUP BY epub_version_id, blob_hash
+            WHERE archived_epub_id IN ({placeholders})
+            GROUP BY archived_epub_id, blob_hash
             """,
-            epub_version_ids,
+            archive_ids,
         ).fetchall()
 
         sizes_by_version: Dict[int, List[Tuple[str, int]]] = {}
 
         for row in rows:
-            sizes_by_version.setdefault(row["epub_version_id"], []).append(
+            sizes_by_version.setdefault(row["archived_epub_id"], []).append(
                 (row["blob_hash"], row["estimated_stored_bytes"])
             )
 
         return sizes_by_version
 
-    async def reconstruct_epub(self, epub_version_id: int) -> bytes:
-        return await self.run(self._reconstruct_epub_sync, epub_version_id)
+    async def reconstruct_epub(self, archive_id: int) -> bytes:
+        return await self.run(self._reconstruct_epub_sync, archive_id)
 
-    def _reconstruct_epub_sync(self, conn: sqlite3.Connection, epub_version_id: int) -> bytes:
+    def _reconstruct_epub_sync(self, conn: sqlite3.Connection, archive_id: int) -> bytes:
+        archive = conn.execute(
+            "SELECT archive_checksum, component_count FROM archived_epub WHERE id = ?",
+            (archive_id,),
+        ).fetchone()
+
+        if archive is None:
+            raise ArchiveIntegrityError("Archived EPUB record is missing")
+
         rows = conn.execute(
             """
-            SELECT c.internal_path, c.size_uncompressed, b.compression, b.data
+            SELECT c.internal_path, c.blob_hash, c.size_uncompressed, b.compression, b.data
             FROM epub_component c
             JOIN blob b ON b.hash = c.blob_hash
-            WHERE c.epub_version_id = ?
+            WHERE c.archived_epub_id = ?
             ORDER BY CASE WHEN c.internal_path = 'mimetype' THEN 0 ELSE 1 END, c.internal_path
             """,
-            (epub_version_id,),
+            (archive_id,),
         ).fetchall()
 
         if not rows:
-            raise ValueError("Archived EPUB has no components")
+            raise ArchiveIntegrityError("Archived EPUB has no components")
+        if len(rows) != archive["component_count"]:
+            raise ArchiveIntegrityError("Archived EPUB component count mismatch")
+
+        checksum_parts: List[Tuple[str, bytes]] = []
+        verified: List[Tuple[str, bytes]] = []
+
+        for row in rows:
+            internal_path = validate_internal_zip_path(row["internal_path"])
+            data = load_blob_payload(row["compression"], row["data"])
+
+            if len(data) != row["size_uncompressed"]:
+                raise ArchiveIntegrityError("Archived EPUB component size mismatch")
+            if hashlib.sha256(data).digest() != row["blob_hash"]:
+                raise ArchiveIntegrityError("Archived EPUB component checksum mismatch")
+
+            checksum_parts.append((internal_path, row["blob_hash"]))
+            verified.append((internal_path, data))
+
+        if compute_archive_checksum(checksum_parts) != archive["archive_checksum"]:
+            raise ArchiveIntegrityError("Archived EPUB checksum mismatch")
 
         with io.BytesIO() as out:
             with zipfile.ZipFile(out, "w") as zf:
-                for row in rows:
-                    internal_path = validate_internal_zip_path(row["internal_path"])
-                    data = load_blob_payload(row["compression"], row["data"])
-
-                    if len(data) != row["size_uncompressed"]:
-                        raise ValueError("Archived EPUB component size mismatch")
-
+                for internal_path, data in verified:
                     if internal_path == "mimetype":
                         info = zipfile.ZipInfo("mimetype")
                         info.compress_type = zipfile.ZIP_STORED
@@ -639,7 +551,8 @@ class ArchiveDB:
         attachment_size: Optional[int],
         message_created_at: datetime,
         epub_bytes: bytes,
-    ) -> bool:
+        archive_generation: int,
+    ) -> str:
         return await self.run(
             self._import_epub_bytes_sync,
             guild_id,
@@ -650,6 +563,7 @@ class ArchiveDB:
             attachment_size,
             message_created_at,
             epub_bytes,
+            archive_generation,
         )
 
     def _import_epub_bytes_sync(
@@ -663,12 +577,24 @@ class ArchiveDB:
         attachment_size: Optional[int],
         message_created_at: datetime,
         epub_bytes: bytes,
-    ) -> bool:
+        archive_generation: int,
+    ) -> str:
+        watch_row = conn.execute(
+            """
+            SELECT historical_scan_complete, archive_generation
+            FROM watched_channel
+            WHERE guild_id = ? AND channel_id = ? AND watch_enabled = 1
+            """,
+            (guild_id, channel_id),
+        ).fetchone()
+        if watch_row is None or watch_row["archive_generation"] != archive_generation:
+            return "stale_generation"
+
         if conn.execute(
-            "SELECT 1 FROM discord_epub WHERE channel_id = ? AND message_id = ? AND attachment_index = ?",
+            "SELECT 1 FROM archived_epub WHERE channel_id = ? AND message_id = ? AND attachment_index = ?",
             (channel_id, message_id, attachment_index),
         ).fetchone():
-            return False
+            return "already_present"
 
         now = unix_now()
         with zipfile.ZipFile(io.BytesIO(epub_bytes), "r") as zf:
@@ -679,23 +605,9 @@ class ArchiveDB:
                 opf_path = validate_internal_zip_path(find_container_rootfile(zf))
             except Exception:
                 opf_path = ""
-            title, creator, manifest_types, spine_orders, cover_image_paths = parse_opf_metadata_from_zip(zf)
-            canonical_key = normalize_key(f"{title} {creator}" if title else filename)
-            book_row = conn.execute(
-                "SELECT id FROM book WHERE canonical_key = ?",
-                (canonical_key,),
-            ).fetchone()
-            if book_row:
-                book_id = book_row["id"]
-            else:
-                cur = conn.execute(
-                    "INSERT INTO book(canonical_key, first_seen_at) VALUES (?, ?)",
-                    (canonical_key, now),
-                )
-                book_id = cur.lastrowid
+            manifest_types, spine_orders, cover_image_paths = parse_opf_metadata_from_zip(zf)
 
             components: List[Tuple[str, str, bytes, str, bytes, int, Optional[int], int, int]] = []
-            fingerprint_parts: List[Tuple[str, bytes]] = []
 
             for info in zf.infolist():
                 if info.is_dir():
@@ -709,7 +621,6 @@ class ArchiveDB:
                 is_manifest_item = 1 if internal_path in manifest_types or internal_path == "mimetype" else 0
                 is_cover_image = 1 if internal_path in cover_image_paths else 0
                 components.append((internal_path, media_type, blob_hash, compression, stored, len(data), spine_order, is_manifest_item, is_cover_image))
-                fingerprint_parts.append((internal_path, blob_hash))
 
             estimate_chapter_bytes = 0
             estimate_chapter_count = 0
@@ -769,27 +680,53 @@ class ArchiveDB:
                     or component[2] in output_image_hashes
                 ]
 
-            fingerprint = compute_epub_fingerprint(fingerprint_parts)
+            archive_checksum = compute_archive_checksum(
+                (component[0], component[2]) for component in components
+            )
+            historical_complete = bool(watch_row["historical_scan_complete"])
+
+            if historical_complete:
+                effective_order = (
+                    conn.execute(
+                        """
+                        SELECT COALESCE(MAX(effective_order), 0)
+                        FROM archived_epub
+                        WHERE channel_id = ? AND is_deleted = 0
+                        """,
+                        (channel_id,),
+                    ).fetchone()[0]
+                    + 1
+                )
+            else:
+                effective_order = 0
+
             cur = conn.execute(
                 """
-                INSERT INTO epub_version(
-                  book_id, original_filename, imported_at, source_size, epub_fingerprint,
-                  component_count, estimated_compiled_chapter_bytes, estimated_compiled_chapter_count
+                INSERT INTO archived_epub(
+                  guild_id, channel_id, message_id, attachment_index, filename,
+                  attachment_size, message_created_at, archive_checksum, component_count,
+                  estimated_compiled_chapter_bytes, estimated_compiled_chapter_count,
+                  effective_order, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    book_id,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    attachment_index,
                     filename,
-                    now,
                     attachment_size,
-                    fingerprint,
+                    dt_to_unix(message_created_at),
+                    archive_checksum,
                     len(components),
                     estimate_chapter_bytes,
                     estimate_chapter_count,
+                    effective_order,
+                    now,
                 ),
             )
-            epub_version_id = cur.lastrowid
+            archive_id = cur.lastrowid
 
             for internal_path, media_type, blob_hash, compression, stored, size_uncompressed, spine_order, is_manifest_item, is_cover_image in components:
                 conn.execute(
@@ -802,76 +739,32 @@ class ArchiveDB:
                 conn.execute("UPDATE blob SET refcount = refcount + 1 WHERE hash = ?", (blob_hash,))
                 conn.execute(
                     """
-                    INSERT INTO epub_component(epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image)
+                    INSERT INTO epub_component(archived_epub_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (epub_version_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image),
+                    (archive_id, internal_path, media_type, blob_hash, size_uncompressed, spine_order, is_manifest_item, is_cover_image),
                 )
 
             for blob_hash, (size_uncompressed, estimated_stored_bytes) in output_image_sizes.items():
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO epub_output_image(
-                      epub_version_id, blob_hash, size_uncompressed, estimated_stored_bytes
+                      archived_epub_id, blob_hash, size_uncompressed, estimated_stored_bytes
                     )
                     VALUES (?, ?, ?, ?)
                     """,
                     (
-                        epub_version_id,
+                        archive_id,
                         blob_hash,
                         size_uncompressed,
                         estimated_stored_bytes,
                     ),
                 )
 
-            watch_row = conn.execute(
-                "SELECT historical_scan_complete FROM watched_channel WHERE channel_id = ?",
-                (channel_id,),
-            ).fetchone()
-            historical_complete = bool(
-                watch_row and watch_row["historical_scan_complete"]
-            )
-
-            if historical_complete:
-                effective_order = (
-                    conn.execute(
-                        """
-                        SELECT COALESCE(MAX(effective_order), 0)
-                        FROM discord_epub
-                        WHERE channel_id = ? AND is_deleted = 0
-                        """,
-                        (channel_id,),
-                    ).fetchone()[0]
-                    + 1
-                )
-            else:
-                effective_order = 0
-
-            conn.execute(
-                """
-                INSERT INTO discord_epub(
-                  guild_id, channel_id, message_id, attachment_index, discord_filename,
-                  attachment_size, message_created_at, epub_version_id, effective_order, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id,
-                    channel_id,
-                    message_id,
-                    attachment_index,
-                    filename,
-                    attachment_size,
-                    dt_to_unix(message_created_at),
-                    epub_version_id,
-                    effective_order,
-                    now,
-                ),
-            )
-
             if not historical_complete:
                 rows = conn.execute(
                     """
-                    SELECT id FROM discord_epub
+                    SELECT id FROM archived_epub
                     WHERE channel_id = ? AND is_deleted = 0
                     ORDER BY message_id ASC, attachment_index ASC
                     """,
@@ -879,7 +772,7 @@ class ArchiveDB:
                 ).fetchall()
                 for order_index, row in enumerate(rows, start=1):
                     conn.execute(
-                        "UPDATE discord_epub SET effective_order = ? WHERE id = ?",
+                        "UPDATE archived_epub SET effective_order = ? WHERE id = ?",
                         (order_index, row["id"]),
                     )
 
@@ -887,7 +780,7 @@ class ArchiveDB:
                 "DELETE FROM import_failure WHERE channel_id = ? AND message_id = ? AND attachment_index = ?",
                 (channel_id, message_id, attachment_index),
             )
-            return True
+            return "imported"
 
     async def record_import_failure(
         self,
@@ -897,8 +790,9 @@ class ArchiveDB:
         attachment_index: int,
         filename: str,
         error_text: str,
-    ) -> None:
-        await self.run(
+        archive_generation: int,
+    ) -> bool:
+        return await self.run(
             self._record_import_failure_sync,
             guild_id,
             channel_id,
@@ -906,6 +800,7 @@ class ArchiveDB:
             attachment_index,
             filename,
             error_text[:1000],
+            archive_generation,
         )
 
     def _record_import_failure_sync(
@@ -917,13 +812,21 @@ class ArchiveDB:
         attachment_index: int,
         filename: str,
         error_text: str,
-    ) -> None:
+        archive_generation: int,
+    ) -> bool:
+        watch = conn.execute(
+            "SELECT archive_generation FROM watched_channel WHERE guild_id = ? AND channel_id = ? AND watch_enabled = 1",
+            (guild_id, channel_id),
+        ).fetchone()
+        if watch is None or watch["archive_generation"] != archive_generation:
+            return False
         now = unix_now()
         conn.execute(
             """
-            INSERT INTO import_failure(channel_id, message_id, attachment_index, guild_id, filename, error_text, first_failed_at, last_failed_at, attempt_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO import_failure(channel_id, message_id, attachment_index, guild_id, filename, error_text, first_failed_at, last_failed_at, attempt_count, notified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)
             ON CONFLICT(channel_id, message_id, attachment_index) DO UPDATE SET
+              filename = excluded.filename,
               error_text = excluded.error_text,
               last_failed_at = excluded.last_failed_at,
               attempt_count = import_failure.attempt_count + 1
@@ -939,6 +842,14 @@ class ArchiveDB:
                 now,
             ),
         )
+        row = conn.execute(
+            """
+            SELECT notified_at FROM import_failure
+            WHERE channel_id = ? AND message_id = ? AND attachment_index = ?
+            """,
+            (channel_id, message_id, attachment_index),
+        ).fetchone()
+        return bool(row is not None and row["notified_at"] is None)
 
 
 ARCHIVE = ArchiveDB(DB_PATH)
@@ -971,47 +882,56 @@ async def watched_categories() -> List[sqlite3.Row]:
     )
 
 
-async def list_special_role_ids() -> List[int]:
-    rows = await ARCHIVE.run(
-        lambda conn: conn.execute(
-            """
-            SELECT role_id
-            FROM special_role
-            WHERE guild_id = ?
-            ORDER BY role_id
-            """,
-            (GUILD_ID,),
-        ).fetchall()
-    )
-    return [row["role_id"] for row in rows]
-
-
-async def add_special_role_id(role_id: int, actor_id: int) -> bool:
-    def sync(conn: sqlite3.Connection) -> bool:
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO special_role(guild_id, role_id, added_at, added_by_user_id)
-            VALUES (?, ?, ?, ?)
-            """,
-            (GUILD_ID, role_id, unix_now(), actor_id),
-        )
-        return cur.rowcount > 0
+async def get_compile_settings() -> Tuple[List[int], List[int]]:
+    def sync(conn: sqlite3.Connection) -> Tuple[List[int], List[int]]:
+        role_ids = [
+            row["role_id"]
+            for row in conn.execute(
+                "SELECT role_id FROM compile_action_role WHERE guild_id = ? ORDER BY role_id",
+                (GUILD_ID,),
+            ).fetchall()
+        ]
+        alert_role_ids = [
+            row["role_id"]
+            for row in conn.execute(
+                "SELECT role_id FROM archive_failure_role WHERE guild_id = ? ORDER BY role_id",
+                (GUILD_ID,),
+            ).fetchall()
+        ]
+        return role_ids, alert_role_ids
 
     return await ARCHIVE.run(sync)
 
 
-async def delete_special_role_id(role_id: int) -> bool:
-    def sync(conn: sqlite3.Connection) -> bool:
-        cur = conn.execute(
-            """
-            DELETE FROM special_role
-            WHERE guild_id = ? AND role_id = ?
-            """,
-            (GUILD_ID, role_id),
-        )
-        return cur.rowcount > 0
+async def replace_compile_settings(
+    role_ids: Iterable[int],
+    alert_role_ids: Iterable[int],
+    actor_id: int,
+) -> None:
+    clean_roles = sorted({int(value) for value in role_ids})
+    clean_alert_roles = sorted({int(value) for value in alert_role_ids})
 
-    return await ARCHIVE.run(sync)
+    if len(clean_roles) > 25 or len(clean_alert_roles) > 25:
+        raise ValueError("Settings support at most 25 compile roles and 25 archive alert roles")
+
+    def sync(conn: sqlite3.Connection) -> None:
+        now = unix_now()
+        conn.execute("DELETE FROM compile_action_role WHERE guild_id = ?", (GUILD_ID,))
+        conn.execute("DELETE FROM archive_failure_role WHERE guild_id = ?", (GUILD_ID,))
+        conn.executemany(
+            "INSERT INTO compile_action_role(guild_id, role_id, added_at, added_by_user_id) VALUES (?, ?, ?, ?)",
+            [(GUILD_ID, role_id, now, actor_id) for role_id in clean_roles],
+        )
+        conn.executemany(
+            "INSERT INTO archive_failure_role(guild_id, role_id, added_at, added_by_user_id) VALUES (?, ?, ?, ?)",
+            [(GUILD_ID, role_id, now, actor_id) for role_id in clean_alert_roles],
+        )
+
+    await ARCHIVE.run(sync)
+
+
+async def list_archive_failure_role_ids() -> List[int]:
+    return (await get_compile_settings())[1]
 
 
 async def has_compile_action_permission(user: Any) -> bool:
@@ -1019,19 +939,19 @@ async def has_compile_action_permission(user: Any) -> bool:
     if perms and perms.administrator:
         return True
 
-    special_role_ids = set(await list_special_role_ids())
-    if not special_role_ids:
+    compile_role_ids = set((await get_compile_settings())[0])
+    if not compile_role_ids:
         return False
 
     return any(
-        getattr(role, "id", None) in special_role_ids
+        getattr(role, "id", None) in compile_role_ids
         for role in getattr(user, "roles", [])
     )
 
 
-async def update_channel_cursor(channel_id: int, **fields: Any) -> None:
+async def update_channel_cursor(channel_id: int, archive_generation: int, **fields: Any) -> bool:
     if not fields:
-        return
+        return True
 
     allowed = {
         "historical_scan_complete",
@@ -1050,17 +970,18 @@ async def update_channel_cursor(channel_id: int, **fields: Any) -> None:
             raise ValueError(f"Unsupported watched_channel field: {key}")
         assignments.append(f"{key} = ?")
         values.append(value)
-    values.append(channel_id)
+    values.extend([channel_id, archive_generation])
 
-    await ARCHIVE.run(
+    changed = await ARCHIVE.run(
         lambda conn: conn.execute(
-            f"UPDATE watched_channel SET {', '.join(assignments)} WHERE channel_id = ?",
+            f"UPDATE watched_channel SET {', '.join(assignments)} WHERE channel_id = ? AND archive_generation = ?",
             values,
-        )
+        ).rowcount
     )
+    return changed > 0
 
 
-async def advance_channel_last_processed_message(channel_id: int, message_id: int) -> None:
+async def advance_channel_last_processed_message(channel_id: int, message_id: int, archive_generation: int) -> None:
     await ARCHIVE.run(
         lambda conn: conn.execute(
             """
@@ -1070,18 +991,24 @@ async def advance_channel_last_processed_message(channel_id: int, message_id: in
               THEN ?
               ELSE last_processed_message_id
             END
-            WHERE channel_id = ?
+            WHERE channel_id = ? AND archive_generation = ?
             """,
-            (message_id, message_id, channel_id),
+            (message_id, message_id, channel_id, archive_generation),
         )
     )
 
 
-async def normalize_channel_effective_order(channel_id: int) -> None:
+async def normalize_channel_effective_order(channel_id: int, archive_generation: int) -> None:
     def sync(conn: sqlite3.Connection) -> None:
+        current = conn.execute(
+            "SELECT archive_generation FROM watched_channel WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        if current is None or current["archive_generation"] != archive_generation:
+            return
         rows = conn.execute(
             """
-            SELECT id FROM discord_epub
+            SELECT id FROM archived_epub
             WHERE channel_id = ? AND is_deleted = 0
             ORDER BY message_id ASC, attachment_index ASC
             """,
@@ -1089,7 +1016,7 @@ async def normalize_channel_effective_order(channel_id: int) -> None:
         ).fetchall()
         for index, row in enumerate(rows, start=1):
             conn.execute(
-                "UPDATE discord_epub SET effective_order = ? WHERE id = ?",
+                "UPDATE archived_epub SET effective_order = ? WHERE id = ?",
                 (index, row["id"]),
             )
 
@@ -1110,7 +1037,7 @@ async def soft_delete_epubs(
         placeholders = ",".join("?" for _ in clean_ids)
         cur = conn.execute(
             f"""
-            UPDATE discord_epub
+            UPDATE archived_epub
             SET is_deleted = 1, deleted_at = ?, deleted_by_user_id = ?, delete_reason = ?
             WHERE guild_id = ? AND channel_id = ? AND id IN ({placeholders}) AND is_deleted = 0
             """,
@@ -1133,7 +1060,7 @@ async def undelete_epubs(
         placeholders = ",".join("?" for _ in clean_ids)
         cur = conn.execute(
             f"""
-            UPDATE discord_epub
+            UPDATE archived_epub
             SET is_deleted = 0, deleted_at = NULL, deleted_by_user_id = NULL, delete_reason = NULL
             WHERE guild_id = ? AND channel_id = ? AND id IN ({placeholders}) AND is_deleted = 1
             """,
@@ -1148,7 +1075,7 @@ async def move_epub_after(channel_id: int, moving_id: int, target_id: Optional[i
     def sync(conn: sqlite3.Connection) -> None:
         rows = conn.execute(
             """
-            SELECT id FROM discord_epub
+            SELECT id FROM archived_epub
             WHERE channel_id = ? AND is_deleted = 0
             ORDER BY effective_order ASC
             """,
@@ -1166,9 +1093,128 @@ async def move_epub_after(channel_id: int, moving_id: int, target_id: Optional[i
             ids.insert(ids.index(target_id) + 1, moving_id)
         for index, row_id in enumerate(ids, start=1):
             conn.execute(
-                "UPDATE discord_epub SET effective_order = ? WHERE id = ?",
+                "UPDATE archived_epub SET effective_order = ? WHERE id = ?",
                 (index, row_id),
             )
 
     await ARCHIVE.run(sync)
+
+
+async def unresolved_import_failures(
+    keys: Iterable[Tuple[int, int, int]],
+) -> List[sqlite3.Row]:
+    clean_keys = list(dict.fromkeys(keys))
+    if not clean_keys:
+        return []
+
+    def sync(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+        rows: List[sqlite3.Row] = []
+        for channel_id, message_id, attachment_index in clean_keys:
+            row = conn.execute(
+                """
+                SELECT channel_id, message_id, attachment_index, filename
+                FROM import_failure
+                WHERE channel_id = ? AND message_id = ? AND attachment_index = ?
+                  AND notified_at IS NULL
+                """,
+                (channel_id, message_id, attachment_index),
+            ).fetchone()
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    return await ARCHIVE.run(sync)
+
+
+async def mark_import_failures_notified(
+    keys: Iterable[Tuple[int, int, int]],
+) -> None:
+    clean_keys = list(dict.fromkeys(keys))
+    if not clean_keys:
+        return
+
+    def sync(conn: sqlite3.Connection) -> None:
+        now = unix_now()
+        conn.executemany(
+            """
+            UPDATE import_failure SET notified_at = ?
+            WHERE channel_id = ? AND message_id = ? AND attachment_index = ?
+              AND notified_at IS NULL
+            """,
+            [(now, *key) for key in clean_keys],
+        )
+
+    await ARCHIVE.run(sync)
+
+
+async def hard_reset_channel(
+    channel_id: int,
+    expected_generation: int,
+    category_id: Optional[int],
+    channel_name: str,
+) -> int:
+    def sync(conn: sqlite3.Connection) -> int:
+        watch = conn.execute(
+            """
+            SELECT * FROM watched_channel
+            WHERE guild_id = ? AND channel_id = ? AND watch_enabled = 1
+              AND archive_generation = ?
+            """,
+            (GUILD_ID, channel_id, expected_generation),
+        ).fetchone()
+        if watch is None:
+            raise ValueError("Channel watch changed before the rescan could start")
+
+        blob_counts = conn.execute(
+            """
+            SELECT c.blob_hash, COUNT(*) AS reference_count
+            FROM epub_component c
+            JOIN archived_epub a ON a.id = c.archived_epub_id
+            WHERE a.guild_id = ? AND a.channel_id = ?
+            GROUP BY c.blob_hash
+            """,
+            (GUILD_ID, channel_id),
+        ).fetchall()
+
+        conn.execute(
+            "DELETE FROM archived_epub WHERE guild_id = ? AND channel_id = ?",
+            (GUILD_ID, channel_id),
+        )
+        conn.execute(
+            "DELETE FROM import_failure WHERE guild_id = ? AND channel_id = ?",
+            (GUILD_ID, channel_id),
+        )
+        conn.execute(
+            "DELETE FROM watched_channel WHERE guild_id = ? AND channel_id = ?",
+            (GUILD_ID, channel_id),
+        )
+
+        for row in blob_counts:
+            conn.execute(
+                "UPDATE blob SET refcount = refcount - ? WHERE hash = ?",
+                (row["reference_count"], row["blob_hash"]),
+            )
+        conn.execute("DELETE FROM blob WHERE refcount = 0")
+
+        new_generation = expected_generation + 1
+        conn.execute(
+            """
+            INSERT INTO watched_channel(
+              channel_id, guild_id, category_id, channel_name, watch_enabled,
+              historical_scan_complete, scan_anchor_message_id,
+              historical_before_message_id, last_processed_message_id,
+              archive_generation, last_error
+            ) VALUES (?, ?, ?, ?, 1, 0, NULL, NULL, NULL, ?, NULL)
+            """,
+            (
+                channel_id,
+                GUILD_ID,
+                category_id,
+                channel_name,
+                new_generation,
+            ),
+        )
+        return new_generation
+
+    return await ARCHIVE.run(sync)
 

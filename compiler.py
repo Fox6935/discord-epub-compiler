@@ -31,7 +31,7 @@ async def compile_selected_epubs(
         safe_filename = safe_log_text(entry.filename)
 
         try:
-            epub_bytes = await ARCHIVE.reconstruct_epub(entry.epub_version_id)
+            epub_bytes = await ARCHIVE.reconstruct_epub(entry.archive_id)
             chapters, images = await asyncio.to_thread(
                 extract_book_content,
                 epub_bytes=epub_bytes,

@@ -1,4 +1,4 @@
-import asyncio
+import contextlib
 from typing import Optional
 
 import discord
@@ -8,124 +8,159 @@ from config import (
     GUILD_ID, TOKEN, bot, get_configured_guild, is_admin, is_configured_guild,
 )
 from db import (
-    ARCHIVE, add_special_role_id, delete_special_role_id, get_watched_channel_row,
-    has_compile_action_permission, list_special_role_ids,
+    ARCHIVE, get_compile_settings, get_watched_channel_row,
+    has_compile_action_permission, replace_compile_settings,
 )
 from epub_tools import is_epub_attachment
 from ingestion import (
-    category_reconcile_loop, cleanup_sessions, enqueue_historical_scan,
+    channel_permission_issues, enqueue_historical_scan,
+    ensure_background_task,
     ensure_live_import_worker_started, ensure_scan_worker_started,
+    ensure_support_tasks_started,
     enqueue_live_message_epubs, reconcile_watched_category, retry_channel_import_failures,
-    startup_channel_work, upsert_watched_category, upsert_watched_channel,
+    is_channel_in_maintenance, reset_and_enqueue_channel, scan_queue_size,
+    start_startup_channel_work, upsert_watched_category, upsert_watched_channel,
 )
 from models import CompileSession, SESSIONS, build_session_key, log, log_success, log_warning
 from ui import CompileLayoutView
 
 
-class RoleManageView(discord.ui.View):
-    def __init__(self, user_id: int):
+class CompileSettingsModal(discord.ui.Modal, title="Compile Settings"):
+    def __init__(self, user_id: int, role_ids: list[int], alert_role_ids: list[int]):
         super().__init__(timeout=300)
         self.user_id = user_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "This role picker isn't yours.",
-                ephemeral=True,
+        self.role_select = discord.ui.RoleSelect(
+            placeholder="Delete, restore, and reorder roles",
+            min_values=0,
+            max_values=25,
+            required=False,
+            default_values=[discord.Object(id=role_id) for role_id in role_ids],
+        )
+        self.alert_role_select = discord.ui.RoleSelect(
+            placeholder="Archive failure alert roles",
+            min_values=0,
+            max_values=25,
+            required=False,
+            default_values=[discord.Object(id=role_id) for role_id in alert_role_ids],
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Compile action roles",
+                description="These roles can delete, restore, and reorder archived EPUBs.",
+                component=self.role_select,
             )
-            return False
-
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "You need Administrator to manage compile roles.",
-                ephemeral=True,
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Archive failure alert roles",
+                description="These roles are mentioned in-channel when EPUB archiving fails.",
+                component=self.alert_role_select,
             )
-            return False
-
-        return True
-
-
-class AddCompileRoleSelect(discord.ui.RoleSelect):
-    def __init__(self):
-        super().__init__(
-            placeholder="Select role to add",
-            min_values=1,
-            max_values=1,
         )
 
-    async def callback(self, interaction: discord.Interaction) -> None:
-        role = self.values[0]
-
-        if role.is_default():
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id or not is_admin(interaction):
             await interaction.response.send_message(
-                "Choose a real server role.",
+                "You need Administrator to change compile settings.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None or not is_configured_guild(interaction.guild):
+            await interaction.response.send_message(
+                "This bot is configured for a different server.",
                 ephemeral=True,
             )
             return
 
-        added = await add_special_role_id(role.id, interaction.user.id)
-        message = (
-            f"{role.mention} can now use `/compile action:delete` and `/compile action:reorder`."
-            if added
-            else f"{role.mention} is already configured."
-        )
-
-        await interaction.response.edit_message(
-            content=message,
-            view=None,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-
-class DeleteCompileRoleSelect(discord.ui.Select):
-    def __init__(self, guild: discord.Guild, role_ids: list[int]):
-        options = []
-
-        for role_id in role_ids[:25]:
-            role = guild.get_role(role_id)
-            label = role.name if role is not None else f"Missing role {role_id}"
-            options.append(
-                discord.SelectOption(
-                    label=label[:100],
-                    value=str(role_id),
-                )
+        roles = list(self.role_select.values)
+        alert_roles = list(self.alert_role_select.values)
+        if any(role.is_default() for role in roles + alert_roles):
+            await interaction.response.send_message(
+                "The @everyone role cannot be used in compile settings.",
+                ephemeral=True,
             )
+            return
 
-        super().__init__(
-            placeholder="Select role to delete",
-            min_values=1,
-            max_values=1,
-            options=options,
+        await replace_compile_settings(
+            [role.id for role in roles],
+            [role.id for role in alert_roles],
+            interaction.user.id,
         )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        role_id = int(self.values[0])
-        role = interaction.guild.get_role(role_id) if interaction.guild else None
-        deleted = await delete_special_role_id(role_id)
-        role_label = role.mention if role is not None else f"`{role_id}`"
-        message = (
-            f"{role_label} removed from compile delete/reorder access."
-            if deleted
-            else "That role is not configured."
-        )
-
-        await interaction.response.edit_message(
-            content=message,
-            view=None,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await interaction.response.send_message(
+            f"Saved {len(roles)} compile role(s) and {len(alert_roles)} archive alert role(s).",
+            ephemeral=True,
         )
 
 
-class AddCompileRoleView(RoleManageView):
-    def __init__(self, user_id: int):
-        super().__init__(user_id)
-        self.add_item(AddCompileRoleSelect())
+class RescanConfirmView(discord.ui.View):
+    def __init__(self, user_id: int, channel_id: int, archive_generation: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.channel_id = channel_id
+        self.archive_generation = archive_generation
+        self.message: Optional[discord.Message] = None
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This rescan confirmation isn't yours.",
+                ephemeral=True,
+            )
+            return False
+        return True
 
-class DeleteCompileRoleView(RoleManageView):
-    def __init__(self, user_id: int, guild: discord.Guild, role_ids: list[int]):
-        super().__init__(user_id)
-        self.add_item(DeleteCompileRoleSelect(guild, role_ids))
+    @discord.ui.button(label="Confirm Rescan", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not is_admin(interaction):
+            await interaction.response.send_message("`/rescan` requires Discord Administrator.", ephemeral=True)
+            return
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel) or channel.id != self.channel_id:
+            await interaction.response.send_message("The rescan channel is no longer available.", ephemeral=True)
+            return
+        row = await get_watched_channel_row(channel.id)
+        if row is None or row["archive_generation"] != self.archive_generation:
+            await interaction.response.send_message(
+                "This channel's archive state changed. Run `/rescan` again.",
+                ephemeral=True,
+            )
+            return
+        blocking, _ = channel_permission_issues(channel)
+        if blocking:
+            await interaction.response.send_message(
+                "Rescan blocked. Missing: " + ", ".join(blocking),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            _, queued = await reset_and_enqueue_channel(channel, self.archive_generation)
+        except Exception as exc:
+            log_warning(f"Rescan reset failed in #{channel.name}: {exc}")
+            await interaction.edit_original_response(
+                content=f"Rescan failed before it could be queued: {exc}",
+                view=None,
+            )
+            return
+
+        queue_note = (
+            f"Rescan queued. Queue size: {scan_queue_size()}."
+            if queued
+            else "The archive was reset, but the scan was not queued; startup recovery will retry it."
+        )
+        await interaction.edit_original_response(content=queue_note, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Rescan cancelled. No data was changed.", view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await self.message.edit(content="Rescan confirmation expired. No data was changed.", view=None)
 
 
 @bot.tree.command(name="compile", description="Compile or manage archived EPUBs in this channel")
@@ -136,8 +171,7 @@ class DeleteCompileRoleView(RoleManageView):
     action=[
         app_commands.Choice(name="delete", value="delete"),
         app_commands.Choice(name="reorder", value="reorder"),
-        app_commands.Choice(name="role_add", value="role_add"),
-        app_commands.Choice(name="role_delete", value="role_delete"),
+        app_commands.Choice(name="settings", value="settings"),
     ]
 )
 async def compile_command(
@@ -161,43 +195,40 @@ async def compile_command(
     selected_action = action.value if action else "select"
     log(f"/compile action={selected_action} run by {interaction.user} in #{channel_name}")
 
-    if selected_action in {"role_add", "role_delete"}:
+    if selected_action == "settings":
         if not is_admin(interaction):
             await interaction.response.send_message(
-                "`/compile action:role_add` and `action:role_delete` require Discord Administrator.",
+                "`/compile action:settings` requires Discord Administrator.",
                 ephemeral=True,
             )
             return
+        role_ids, alert_role_ids = await get_compile_settings()
+        await interaction.response.send_modal(
+            CompileSettingsModal(interaction.user.id, role_ids, alert_role_ids)
+        )
+        return
 
-        if selected_action == "role_add":
-            await interaction.response.send_message(
-                "Choose a role to grant compile delete/reorder access.",
-                view=AddCompileRoleView(interaction.user.id),
-                ephemeral=True,
-            )
-            return
-
-        role_ids = await list_special_role_ids()
-
-        if not role_ids:
-            await interaction.response.send_message(
-                "No compile roles are configured.",
-                ephemeral=True,
-            )
-            return
-
+    if is_channel_in_maintenance(interaction.channel.id):
         await interaction.response.send_message(
-            "Choose a role to remove from compile delete/reorder access.",
-            view=DeleteCompileRoleView(interaction.user.id, interaction.guild, role_ids),
+            "This channel's archive is being reset. Try again after its rescan is queued.",
             ephemeral=True,
         )
         return
 
-    if isinstance(interaction.channel, discord.TextChannel):
+    if selected_action == "select" and isinstance(interaction.channel, discord.TextChannel):
         me = interaction.guild.me
-        if me is not None and not interaction.channel.permissions_for(me).attach_files:
+        if me is not None:
+            perms = interaction.channel.permissions_for(me)
+        else:
+            perms = None
+        if perms is not None and not (perms.send_messages and perms.attach_files):
+            missing = []
+            if not perms.send_messages:
+                missing.append("Send Messages")
+            if not perms.attach_files:
+                missing.append("Attach Files")
             await interaction.response.send_message(
-                "I can't upload files in this channel.",
+                "I can't deliver compiled EPUBs in this channel. Missing: " + ", ".join(missing),
                 ephemeral=True,
             )
             return
@@ -269,6 +300,65 @@ async def compile_command(
     view.message = msg
 
 
+@bot.tree.command(name="rescan", description="Delete and rebuild this channel's EPUB archive")
+async def rescan_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("Use this command in a server channel.", ephemeral=True)
+        return
+    if not is_configured_guild(interaction.guild):
+        await interaction.response.send_message("This bot is configured for a different server.", ephemeral=True)
+        return
+    if not is_admin(interaction):
+        await interaction.response.send_message("`/rescan` requires Discord Administrator.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use `/rescan` in a standard text or announcement channel.",
+            ephemeral=True,
+        )
+        return
+    if is_channel_in_maintenance(channel.id):
+        await interaction.response.send_message("This channel is already being reset.", ephemeral=True)
+        return
+    row = await get_watched_channel_row(channel.id)
+    if row is None:
+        await interaction.response.send_message(
+            "This channel is not actively watched. Use `/scan action:channel_enable` first.",
+            ephemeral=True,
+        )
+        return
+    blocking, warnings = channel_permission_issues(channel)
+    if blocking:
+        await interaction.response.send_message(
+            "Rescan blocked. Missing: " + ", ".join(blocking),
+            ephemeral=True,
+        )
+        return
+
+    warning_text = (
+        f"\n\nPermission warning: missing {', '.join(warnings)}. Archiving can proceed, "
+        "but compiled EPUB delivery will not work until fixed."
+        if warnings
+        else ""
+    )
+    view = RescanConfirmView(
+        interaction.user.id,
+        channel.id,
+        row["archive_generation"],
+    )
+    await interaction.response.send_message(
+        "This WILL permanently delete every archived EPUB, soft-delete record, custom order, "
+        "scan cursor, and import failure for this channel from SQLite before rescanning Discord "
+        "history from scratch. Discord messages and attachments will not be deleted. Files no "
+        "longer present in Discord cannot be recovered."
+        + warning_text,
+        view=view,
+        ephemeral=True,
+    )
+    view.message = await interaction.original_response()
+
+
 @bot.tree.command(name="scan", description="Enable or disable SQLite EPUB archiving for this channel or category")
 @app_commands.describe(action="Watch management action")
 @app_commands.choices(
@@ -302,21 +392,31 @@ async def scan_command(
         await interaction.response.send_message("Use `/scan` in a standard text or announcement channel.", ephemeral=True)
         return
 
-    me = interaction.guild.me
-    if me is not None:
-        perms = channel.permissions_for(me)
-        if not (perms.view_channel and perms.read_message_history):
+    permission_warnings: list[str] = []
+    if action.value == "channel_enable":
+        blocking, permission_warnings = channel_permission_issues(channel)
+        if blocking:
             await interaction.response.send_message(
-                "I need View Channel and Read Message History to scan this channel.",
+                "I cannot scan this channel. Missing: " + ", ".join(blocking),
                 ephemeral=True,
             )
             return
+    permission_note = (
+        " Permission warning: missing " + ", ".join(permission_warnings) +
+        "; archiving will work, but compiled EPUB delivery will not."
+        if permission_warnings
+        else ""
+    )
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     if action.value == "channel_enable":
         await upsert_watched_channel(channel, True)
-        asyncio.create_task(retry_channel_import_failures(channel))
+        ensure_background_task(
+            f"retry-imports-{channel.id}",
+            lambda: retry_channel_import_failures(channel),
+            restart=False,
+        )
         watched = await get_watched_channel_row(channel.id)
 
         if watched is not None and not watched["historical_scan_complete"]:
@@ -330,7 +430,7 @@ async def scan_command(
             scan_note = "Historical backfill is already complete."
 
         await interaction.followup.send(
-            f"This channel is now watched. {scan_note}",
+            f"This channel is now watched. {scan_note}{permission_note}",
             ephemeral=True,
         )
         return
@@ -362,9 +462,12 @@ async def scan_command(
 
     if action.value == "category_enable":
         await upsert_watched_category(category, True)
-        added = await reconcile_watched_category(category)
+        stats = await reconcile_watched_category(category)
         await interaction.followup.send(
-            f"Category watching enabled for {category.name}. Added or refreshed eligible channels; {added} new backfill job(s) started.",
+            f"Category watching enabled for {category.name}. "
+            f"Checked {stats['checked']}; queued {stats['queued']}; "
+            f"new channels {stats['added']}; skipped {stats['skipped']}; "
+            f"permission warnings {stats['warnings']}.",
             ephemeral=True,
         )
         return
@@ -389,13 +492,15 @@ async def on_message(message: discord.Message) -> None:
     if not any(is_epub_attachment(att) for att in message.attachments):
         return
 
-    enqueue_live_message_epubs(message)
+    enqueue_live_message_epubs(message, row["archive_generation"])
 
 
 @bot.event
 async def on_ready() -> None:
     log(f"Logged in as {bot.user}")
-    await ARCHIVE.bootstrap()
+    if not getattr(bot, "_archive_bootstrapped", False):
+        await ARCHIVE.bootstrap()
+        bot._archive_bootstrapped = True
     guild = get_configured_guild()
 
     if guild is None:
@@ -417,17 +522,13 @@ async def on_ready() -> None:
             "live attachment ingestion may not see new EPUB uploads"
         )
 
-    if not getattr(bot, "_cleanup_started", False):
-        bot._cleanup_started = True
-        asyncio.create_task(cleanup_sessions())
-        ensure_scan_worker_started()
-        ensure_live_import_worker_started()
-        log("Cleanup task started")
+    ensure_scan_worker_started()
+    ensure_live_import_worker_started()
+    ensure_support_tasks_started()
 
     if guild is not None and not getattr(bot, "_guild_work_started", False):
         bot._guild_work_started = True
-        asyncio.create_task(category_reconcile_loop())
-        asyncio.create_task(startup_channel_work())
+        start_startup_channel_work()
     elif guild is None and not getattr(bot, "_guild_work_started", False):
         log_warning("Guild-dependent startup work skipped because configured guild is unavailable")
 
