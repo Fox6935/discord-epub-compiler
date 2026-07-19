@@ -8,7 +8,7 @@ from config import (
     GUILD_ID, TOKEN, bot, get_configured_guild, is_admin, is_configured_guild,
 )
 from db import (
-    ARCHIVE, get_compile_settings, get_watched_channel_row,
+    ARCHIVE, delete_import_failures_for_messages, get_compile_settings, get_watched_channel_row,
     has_compile_action_permission, replace_compile_settings,
 )
 from epub_tools import is_epub_attachment
@@ -430,7 +430,8 @@ async def scan_command(
             scan_note = "Historical backfill is already complete."
 
         await interaction.followup.send(
-            f"This channel is now watched. {scan_note}{permission_note}",
+            f"This channel is now watched. Recorded archive failures were queued for retry. "
+            f"{scan_note}{permission_note}",
             ephemeral=True,
         )
         return
@@ -493,6 +494,20 @@ async def on_message(message: discord.Message) -> None:
         return
 
     enqueue_live_message_epubs(message, row["archive_generation"])
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    if payload.guild_id != GUILD_ID:
+        return
+    await delete_import_failures_for_messages(payload.channel_id, [payload.message_id])
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    if payload.guild_id != GUILD_ID:
+        return
+    await delete_import_failures_for_messages(payload.channel_id, payload.message_ids)
 
 
 @bot.event

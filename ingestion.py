@@ -16,7 +16,8 @@ from config import (
     SCAN_WATCHDOG_SECONDS, bot, get_configured_guild, is_configured_guild,
 )
 from db import (
-    ARCHIVE, advance_channel_last_processed_message, get_watched_channel_row,
+    ARCHIVE, advance_channel_last_processed_message, delete_import_failure_keys,
+    get_watched_channel_row,
     hard_reset_channel, normalize_channel_effective_order, unix_now, update_channel_cursor,
     watched_categories, watched_channels,
 )
@@ -801,6 +802,10 @@ async def retry_channel_import_failures(channel: discord.TextChannel) -> None:
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound:
+            await delete_import_failure_keys(
+                (channel.id, message_id, attachment_index)
+                for attachment_index in attachment_indexes
+            )
             continue
         except discord.Forbidden:
             log_warning(f"Cannot retry failed imports in #{channel.name}: missing message access")
@@ -809,10 +814,25 @@ async def retry_channel_import_failures(channel: discord.TextChannel) -> None:
             log_warning(f"Failed to fetch message {message_id} for retry: {exc}")
             continue
 
+        current_epub_indexes = {
+            index
+            for index, attachment in enumerate(message.attachments)
+            if is_epub_attachment(attachment)
+        }
+        missing_indexes = attachment_indexes - current_epub_indexes
+        if missing_indexes:
+            await delete_import_failure_keys(
+                (channel.id, message_id, attachment_index)
+                for attachment_index in missing_indexes
+            )
+        retry_indexes = attachment_indexes & current_epub_indexes
+        if not retry_indexes:
+            continue
+
         await import_message_epubs(
             message,
             archive_generation,
-            only_attachment_indexes=attachment_indexes,
+            only_attachment_indexes=retry_indexes,
         )
 
     await ARCHIVE_FAILURE_NOTIFIER.flush_channel(channel.id)
@@ -927,11 +947,6 @@ async def startup_channel_work() -> None:
             if not isinstance(channel, discord.TextChannel):
                 continue
             log_channel_permission_diagnostics(channel)
-            ensure_background_task(
-                f"retry-imports-{channel.id}",
-                lambda channel=channel: retry_channel_import_failures(channel),
-                restart=False,
-            )
             ensure_background_task(
                 f"catch-up-{channel.id}",
                 lambda channel=channel: catch_up_channel(channel),

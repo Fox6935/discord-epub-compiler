@@ -1147,6 +1147,40 @@ async def mark_import_failures_notified(
     await ARCHIVE.run(sync)
 
 
+async def delete_import_failure_keys(
+    keys: Iterable[Tuple[int, int, int]],
+) -> None:
+    clean_keys = list(dict.fromkeys(keys))
+    if not clean_keys:
+        return
+
+    await ARCHIVE.run(
+        lambda conn: conn.executemany(
+            """
+            DELETE FROM import_failure
+            WHERE channel_id = ? AND message_id = ? AND attachment_index = ?
+            """,
+            clean_keys,
+        )
+    )
+
+
+async def delete_import_failures_for_messages(
+    channel_id: int,
+    message_ids: Iterable[int],
+) -> None:
+    clean_message_ids = list(dict.fromkeys(int(value) for value in message_ids))
+    if not clean_message_ids:
+        return
+
+    await ARCHIVE.run(
+        lambda conn: conn.executemany(
+            "DELETE FROM import_failure WHERE channel_id = ? AND message_id = ?",
+            [(channel_id, message_id) for message_id in clean_message_ids],
+        )
+    )
+
+
 async def hard_reset_channel(
     channel_id: int,
     expected_generation: int,

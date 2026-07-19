@@ -75,7 +75,9 @@ python bot.py
 
 Requires Discord Administrator.
 
-- `channel_enable`: watch the current channel and start or resume historical backfill
+- `channel_enable`: watch the current channel, retry its recorded archive failures,
+  and start or resume historical backfill. Running it again while already enabled
+  deliberately retries those failures again.
 - `channel_disable`: stop watching the current channel
 - `category_enable`: watch eligible text/news channels in the current category
 - `category_disable`: stop category reconciliation; existing watched channels remain watched
@@ -120,6 +122,11 @@ Archive Failed: Filename2.epub
 Long batches are split to respect Discord's 2,000-character message limit, with the
 role mentions repeated in each message. An unresolved failure is marked notified
 only after its channel message is sent successfully.
+
+Recorded failures are not automatically retried at bot startup. Use
+`/scan action:channel_enable` in a channel to retry them deliberately. Failure rows
+are removed when Discord reports that their source message was deleted. A manual
+retry also removes rows whose message or EPUB attachment no longer exists.
 
 ## Archive Files
 
