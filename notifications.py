@@ -116,7 +116,7 @@ class ArchiveFailureNotifier:
             return
 
         role_mentions = " ".join(role.mention for role in roles)
-        chunks = build_failure_channel_chunks(ordered, role_mentions)
+        chunks = build_failure_channel_chunks(ordered, role_mentions, guild.id)
 
         for content, keys in chunks:
             try:
@@ -146,39 +146,64 @@ class ArchiveFailureNotifier:
 def build_failure_channel_chunks(
     failures: List[Tuple[FailureKey, str]],
     role_mentions: str,
+    guild_id: int,
 ) -> List[Tuple[str, List[FailureKey]]]:
+    grouped: "OrderedDict[Tuple[int, int], List[Tuple[FailureKey, str]]]" = OrderedDict()
+    for key, filename in failures:
+        grouped.setdefault((key[0], key[1]), []).append((key, filename))
+
     chunks: List[Tuple[str, List[FailureKey]]] = []
     lines: List[str] = []
     keys: List[FailureKey] = []
     header = f"{role_mentions} \n"
-    current_length = len(header)
-    prefix = "Archive Failed: "
 
-    for key, filename in failures:
-        max_filename = max(1, 2000 - len(header) - len(prefix))
-        safe_filename = filename.replace("\r", "_").replace("\n", "_")
-        if len(safe_filename) > max_filename:
-            safe_filename = (
-                safe_filename[: max_filename - 3] + "..."
-                if max_filename > 3
-                else safe_filename[:max_filename]
-            )
-        line = f"{prefix}{safe_filename}"
-        added_length = len(line) + (1 if lines else 0)
+    def content_length(candidate_lines: List[str]) -> int:
+        return len(header) + len("\n".join(candidate_lines))
 
-        if lines and current_length + added_length > 2000:
+    def flush() -> None:
+        nonlocal lines, keys
+        if lines:
             chunks.append((header + "\n".join(lines), keys))
             lines = []
             keys = []
-            current_length = len(header)
 
-        had_lines = bool(lines)
-        lines.append(line)
-        keys.append(key)
-        current_length += len(line) + (1 if had_lines else 0)
+    for (channel_id, message_id), group in grouped.items():
+        link = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+        archive_line = f"Archive Failed: {link}"
+        max_filename = max(1, 2000 - len(header) - len(archive_line) - len("\n  - "))
+        filename_rows: List[Tuple[FailureKey, str]] = []
 
-    if lines:
-        chunks.append((header + "\n".join(lines), keys))
+        for key, filename in group:
+            safe_filename = filename.replace("\r", "_").replace("\n", "_")
+            if len(safe_filename) > max_filename:
+                safe_filename = (
+                    safe_filename[: max_filename - 3] + "..."
+                    if max_filename > 3
+                    else safe_filename[:max_filename]
+                )
+            filename_rows.append((key, f"  - {safe_filename}"))
+
+        complete_block = [archive_line, *(line for _, line in filename_rows)]
+        if content_length(lines + complete_block) <= 2000:
+            lines.extend(complete_block)
+            keys.extend(key for key, _ in filename_rows)
+            continue
+
+        flush()
+        if content_length(complete_block) <= 2000:
+            lines.extend(complete_block)
+            keys.extend(key for key, _ in filename_rows)
+            continue
+
+        lines.append(archive_line)
+        for key, filename_line in filename_rows:
+            if content_length(lines + [filename_line]) > 2000:
+                flush()
+                lines.append(archive_line)
+            lines.append(filename_line)
+            keys.append(key)
+
+    flush()
 
     return chunks
 
