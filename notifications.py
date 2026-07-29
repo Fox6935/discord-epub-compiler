@@ -181,7 +181,7 @@ def build_failure_channel_chunks(
                     if max_filename > 3
                     else safe_filename[:max_filename]
                 )
-            filename_rows.append((key, f"  - {safe_filename}"))
+            filename_rows.append((key, f"  • {safe_filename}"))
 
         complete_block = [archive_line, *(line for _, line in filename_rows)]
         if content_length(lines + complete_block) <= 2000:

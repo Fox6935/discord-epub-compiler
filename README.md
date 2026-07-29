@@ -114,10 +114,13 @@ after 15 seconds of quiet time. Additional failures reset the delay. Finishing a
 channel scan flushes its pending failures immediately. Messages are formatted as:
 
 ```text
-@Role
-Archive Failed: Filename1.epub
-Archive Failed: Filename2.epub
+@FirstRole @SecondRole 
+Archive Failed: https://discord.com/channels/GuildId/ChannelId/MessageId
+  • Filename1.epub
+  • Filename2.epub
 ```
+
+Failures are grouped by their source Discord message, so the jump link appears once followed by every failed EPUB attachment from that message.
 
 Long batches are split to respect Discord's 2,000-character message limit, with the
 role mentions repeated in each message. An unresolved failure is marked notified
