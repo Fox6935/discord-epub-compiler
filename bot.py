@@ -521,7 +521,7 @@ async def on_ready() -> None:
     if guild is None:
         log_warning(
             f"Configured guild {GUILD_ID} is not available to this bot. "
-            "Check that GUILD_ID is the server ID for the bot's installed server "
+            "Check that DISCORD_GUILD_ID is the server ID for the bot's installed server "
             "and that this application has been invited there with the bot scope."
         )
     else:
@@ -572,6 +572,6 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("Set DISCORD_TOKEN in your environment.")
     if not GUILD_ID:
-        raise RuntimeError("Set DISCORD_GUILD_ID or GUILD_ID in your environment.")
+        raise RuntimeError("Set DISCORD_GUILD_ID in your environment.")
 
     bot.run(TOKEN)

@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 ```env
 DISCORD_TOKEN=your_token_here
-GUILD_ID=your_discord_server_id
+DISCORD_GUILD_ID=your_discord_server_id
 ```
 
 Optional environment variables:
@@ -144,7 +144,7 @@ Keep all three files together while the bot is running. They are normal SQLite s
 
 ## Notes
 
-- The bot is single-guild only. Set `GUILD_ID` or `DISCORD_GUILD_ID`.
+- The bot is single-guild only. Set `DISCORD_GUILD_ID`.
 - Compile-time source retrieval is DB-backed.
 - Live ingestion depends on Message Content Intent so Discord includes attachment metadata in message events.
 - Deleted EPUBs are soft-deleted and can be restored from `/compile action:delete`.

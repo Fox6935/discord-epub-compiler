@@ -10,10 +10,10 @@ load_dotenv()
 DEFAULT_DB_PATH = "/compileSQL/epub_archive.sqlite3"
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
-GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", os.environ.get("GUILD_ID", "0")))
+GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 DB_PATH = os.environ.get("EPUB_ARCHIVE_DB", DEFAULT_DB_PATH)
-EXTERNAL_UPLOAD_URL = os.environ.get("api_url", os.environ.get("API_URL", ""))
-EXTERNAL_UPLOAD_KEY = os.environ.get("api_key", os.environ.get("API_KEY", ""))
+EXTERNAL_UPLOAD_URL = os.environ.get("API_URL", "")
+EXTERNAL_UPLOAD_KEY = os.environ.get("API_KEY", "")
 
 SESSION_TIMEOUT_SECONDS = 15 * 60
 MAX_SESSION_LIFETIME_SECONDS = 60 * 60
