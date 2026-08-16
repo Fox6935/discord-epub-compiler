@@ -13,7 +13,8 @@ import discord
 from config import (
     CATEGORY_RECONCILE_SECONDS, GUILD_ID, HISTORY_BATCH_SIZE, HTTP_TIMEOUT_SECONDS,
     LIVE_IMPORT_DELAY_SECONDS, LIVE_IMPORT_RATE_SECONDS, MAX_SOURCE_EPUB_BYTES,
-    SCAN_WATCHDOG_SECONDS, bot, get_configured_guild, is_configured_guild,
+    MAX_CONCURRENT_CATCHUPS, SCAN_WATCHDOG_SECONDS, bot, get_configured_guild,
+    is_configured_guild,
 )
 from db import (
     ARCHIVE, advance_channel_last_processed_message, delete_import_failure_keys,
@@ -41,6 +42,7 @@ LIVE_IMPORT_PENDING_BY_MESSAGE: Dict[tuple[int, int], int] = {}
 IMPORTING_ATTACHMENT_KEYS: Set[tuple[int, int, int]] = set()
 IMPORTING_ATTACHMENT_LOCK = asyncio.Lock()
 BACKGROUND_TASKS: Dict[str, asyncio.Task] = {}
+CATCHUP_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CATCHUPS)
 
 
 def touch_scan_heartbeat(channel_id: int) -> None:
@@ -721,6 +723,11 @@ def start_startup_channel_work() -> None:
 
 
 async def catch_up_channel(channel: discord.TextChannel) -> None:
+    async with CATCHUP_SEMAPHORE:
+        await catch_up_channel_unlimited(channel)
+
+
+async def catch_up_channel_unlimited(channel: discord.TextChannel) -> None:
     row = await get_watched_channel_row(channel.id)
     if row is None:
         return
