@@ -132,6 +132,7 @@ class EpubPickerSelect(discord.ui.Select):
             return
 
         session = view.session
+        await interaction.response.defer()
 
         async with session.lock:
             session.touch()
@@ -153,7 +154,7 @@ class EpubPickerSelect(discord.ui.Select):
             new_view = CompileLayoutView(session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class FirstPageButton(discord.ui.Button["CompileLayoutView"]):
@@ -170,6 +171,8 @@ class FirstPageButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
             view.session.current_page = 0
@@ -177,7 +180,7 @@ class FirstPageButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class LastPageButton(discord.ui.Button["CompileLayoutView"]):
@@ -194,6 +197,8 @@ class LastPageButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
             view.session.current_page = view.session.page_count - 1
@@ -201,7 +206,7 @@ class LastPageButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 def visible_page_indexes(current_page: int, page_count: int, max_buttons: int = 5) -> List[int]:
@@ -241,6 +246,8 @@ class PageJumpButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
 
@@ -250,7 +257,7 @@ class PageJumpButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
@@ -266,6 +273,8 @@ class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
             view.session.remove_all_images = not view.session.remove_all_images
@@ -273,7 +282,7 @@ class ToggleRemoveImagesButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
@@ -290,6 +299,8 @@ class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
             page_entries = view.session.current_page_entries()
@@ -300,7 +311,7 @@ class SelectPageButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class ClearPageButton(discord.ui.Button["CompileLayoutView"]):
@@ -317,6 +328,8 @@ class ClearPageButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.touch()
             page_ids = {e.entry_id for e in view.session.current_page_entries()}
@@ -325,7 +338,7 @@ class ClearPageButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class OpenSearchModalButton(discord.ui.Button["CompileLayoutView"]):
@@ -362,8 +375,7 @@ class OpenCompileModalButton(discord.ui.Button["CompileLayoutView"]):
         if view is None:
             return
 
-        async with view.session.lock:
-            has_selection = bool(view.session.selected_ids)
+        has_selection = bool(view.session.selected_ids)
 
         if not has_selection:
             await interaction.response.send_message(
@@ -568,6 +580,8 @@ class FilenameSearchModal(discord.ui.Modal, title="Advanced Filename Search"):
             )
             return
 
+        await interaction.response.defer()
+
         async with self.session.lock:
             self.session.touch()
             self.session.filename_filter = FilenameFilter(
@@ -578,7 +592,7 @@ class FilenameSearchModal(discord.ui.Modal, title="Advanced Filename Search"):
 
             new_view = CompileLayoutView(self.session)
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
@@ -708,10 +722,7 @@ class CompileNameModal(discord.ui.Modal, title="Compile EPUB"):
                 )
                 await interaction.followup.send(
                     (
-                        "The compiled EPUB is too large for Discord, and external upload failed.\n"
-                        f"Compiled size: {format_bytes(len(output_bytes))}\n"
-                        f"Discord upload limit: {format_bytes(upload_limit)}\n"
-                        f"Error: {safe_error}"
+                        "The compiled EPUB is too large for Discord, and external upload failed."
                     )[:1900],
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
@@ -781,6 +792,8 @@ class OpenPlacementPickerButton(discord.ui.Button["CompileLayoutView"]):
             )
             return
 
+        await interaction.response.defer()
+
         async with view.session.lock:
             view.session.reorder_moving_id = next(iter(view.session.selected_ids))
             view.session.placement_ids.clear()
@@ -790,7 +803,7 @@ class OpenPlacementPickerButton(discord.ui.Button["CompileLayoutView"]):
             new_view = CompileLayoutView(view.session)
             new_view.message = view.message
 
-        await interaction.response.edit_message(view=new_view)
+        await interaction.edit_original_response(view=new_view)
 
 
 class DeleteConfirmButton(discord.ui.Button["CompileLayoutView"]):
@@ -829,8 +842,10 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
             )
             return
 
+        await interaction.response.defer()
+
         if not await has_compile_action_permission(interaction.user):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "You need Administrator or a configured role.",
                 ephemeral=True,
             )
@@ -871,7 +886,7 @@ class DeleteReasonModal(discord.ui.Modal, title="Delete or Restore EPUBs"):
         self.session.loaded_image_archive_ids.clear()
         self.session.touch()
 
-        await interaction.response.edit_message(view=CompileLayoutView(self.session))
+        await interaction.edit_original_response(view=CompileLayoutView(self.session))
         await interaction.followup.send(
             f"Soft-deleted {deleted_count} EPUB(s). Restored {restored_count} EPUB(s).",
             ephemeral=True,
@@ -945,6 +960,8 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
 
             target_id = first.archive_id
 
+        await interaction.response.defer()
+
         await move_epub_after(
             session.channel_id,
             moving_entry.archive_id,
@@ -962,7 +979,7 @@ class ReorderApplyButton(discord.ui.Button["CompileLayoutView"]):
         session.current_page = 0
         session.touch()
 
-        await interaction.response.edit_message(view=CompileLayoutView(session))
+        await interaction.edit_original_response(view=CompileLayoutView(session))
         await interaction.followup.send("Reorder saved.", ephemeral=True)
 
 
