@@ -1,4 +1,5 @@
 import io
+import json
 from typing import Any, Dict
 
 import aiohttp
@@ -10,6 +11,33 @@ def external_upload_enabled() -> bool:
     return bool(EXTERNAL_UPLOAD_URL and EXTERNAL_UPLOAD_KEY)
 
 
+def download_url_from_response(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise RuntimeError("External upload returned an invalid JSON response")
+
+    if payload.get("Result") != "OK":
+        detail = str(payload.get("ErrorMessage") or "unknown API error")
+        raise RuntimeError(f"External upload was rejected: {detail}")
+
+    file_info = payload.get("FileInfo")
+    if not isinstance(file_info, dict):
+        raise RuntimeError("External upload response did not include FileInfo")
+
+    base_url = payload.get("Url")
+    file_id = file_info.get("Id")
+    if isinstance(base_url, str) and base_url and isinstance(file_id, str) and file_id:
+        return base_url + file_id
+
+    download_url = file_info.get("UrlDownload")
+    if not isinstance(download_url, str) or not download_url:
+        raise RuntimeError(
+            "External upload response did not include Url + FileInfo.Id "
+            "or FileInfo.UrlDownload"
+        )
+
+    return download_url
+
+
 async def upload_epub_bytes(
     output_bytes: bytes,
     filename: str,
@@ -19,7 +47,7 @@ async def upload_epub_bytes(
 
     form = aiohttp.FormData()
     form.add_field("allowedDownloads", "10")
-    form.add_field("expiryDays", "5")
+    form.add_field("expiryDays", "1")
     form.add_field(
         "file",
         io.BytesIO(output_bytes),
@@ -35,14 +63,23 @@ async def upload_epub_bytes(
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(EXTERNAL_UPLOAD_URL, headers=headers, data=form) as response:
-            response.raise_for_status()
-            payload: Dict[str, Any] = await response.json(content_type=None)
+            response_text = await response.text()
 
-    base_url = str(payload.get("Url") or "")
-    file_info = payload.get("FileInfo") or {}
-    file_id = str(file_info.get("Id") or "")
+            try:
+                payload: Dict[str, Any] = json.loads(response_text)
+            except (TypeError, json.JSONDecodeError) as exc:
+                if response.status >= 400:
+                    detail = response_text.strip()[:500] or response.reason
+                    raise RuntimeError(
+                        f"External upload failed with HTTP {response.status}: {detail}"
+                    ) from exc
+                raise RuntimeError("External upload returned invalid JSON") from exc
 
-    if not base_url or not file_id:
-        raise RuntimeError("External upload response did not include a download link")
+            if response.status >= 400:
+                api_error = payload.get("ErrorMessage") if isinstance(payload, dict) else None
+                detail = str(api_error or response.reason)
+                raise RuntimeError(
+                    f"External upload failed with HTTP {response.status}: {detail}"
+                )
 
-    return base_url + file_id
+    return download_url_from_response(payload)
