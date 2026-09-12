@@ -57,6 +57,7 @@ async def upload_epub_bytes(
 
     headers = {
         "accept": "application/json",
+        "Accept-Encoding": "identity",
         "apikey": EXTERNAL_UPLOAD_KEY,
     }
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
