@@ -20,6 +20,7 @@ from ingestion import (
     enqueue_live_message_epubs, reconcile_watched_category, retry_channel_import_failures,
     is_channel_in_maintenance, reset_and_enqueue_channel, scan_queue_size,
     start_startup_channel_work, upsert_watched_category, upsert_watched_channel,
+    refresh_channel_metadata,
 )
 from models import CompileSession, SESSIONS, build_session_key, log, log_success, log_warning
 from ui import CompileLayoutView
@@ -508,6 +509,13 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
     if payload.guild_id != GUILD_ID:
         return
     await delete_import_failures_for_messages(payload.channel_id, payload.message_ids)
+
+
+@bot.event
+async def on_guild_channel_update(
+    before: discord.abc.GuildChannel, after: discord.abc.GuildChannel,
+) -> None:
+    await refresh_channel_metadata(after)
 
 
 @bot.event

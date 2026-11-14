@@ -74,6 +74,59 @@ def channel_permission_issues(channel: discord.TextChannel) -> tuple[List[str], 
     return blocking, warnings
 
 
+def _refresh_channel_metadata(conn: sqlite3.Connection, channel: discord.abc.GuildChannel) -> None:
+    category = channel.category
+    updated = conn.execute(
+        """
+        UPDATE watched_channel SET channel_name = ?, category_id = ?
+        WHERE guild_id = ? AND channel_id = ?
+        """,
+        (channel.name, category.id if category else None, GUILD_ID, channel.id),
+    )
+    if updated.rowcount and category is not None:
+        conn.execute(
+            """
+            INSERT INTO watched_category(category_id, guild_id, category_name, watch_enabled)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(category_id) DO UPDATE SET category_name = excluded.category_name
+            """,
+            (category.id, GUILD_ID, category.name),
+        )
+
+
+async def refresh_channel_metadata(channel: discord.abc.GuildChannel) -> None:
+    if not is_configured_guild(channel.guild):
+        return
+    if isinstance(channel, discord.CategoryChannel):
+        await ARCHIVE.run(lambda conn: conn.execute(
+            "UPDATE watched_category SET category_name = ? WHERE guild_id = ? AND category_id = ?",
+            (channel.name, GUILD_ID, channel.id),
+        ))
+    elif is_eligible_watch_channel(channel):
+        await ARCHIVE.run(_refresh_channel_metadata, channel)
+
+
+async def reconcile_channel_metadata(guild: discord.Guild) -> None:
+    def sync(conn: sqlite3.Connection) -> None:
+        for row in conn.execute(
+            "SELECT channel_id FROM watched_channel WHERE guild_id = ?", (GUILD_ID,)
+        ).fetchall():
+            channel = guild.get_channel(row["channel_id"])
+            if is_eligible_watch_channel(channel):
+                _refresh_channel_metadata(conn, channel)
+        for row in conn.execute(
+            "SELECT category_id FROM watched_category WHERE guild_id = ?", (GUILD_ID,)
+        ).fetchall():
+            category = guild.get_channel(row["category_id"])
+            if isinstance(category, discord.CategoryChannel):
+                conn.execute(
+                    "UPDATE watched_category SET category_name = ? WHERE category_id = ?",
+                    (category.name, category.id),
+                )
+
+    await ARCHIVE.run(sync)
+
+
 async def upsert_watched_channel(channel: discord.abc.GuildChannel, enabled: bool) -> None:
     def sync(conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -97,6 +150,8 @@ async def upsert_watched_channel(channel: discord.abc.GuildChannel, enabled: boo
                 1 if enabled else 0,
             ),
         )
+
+        _refresh_channel_metadata(conn, channel)
 
     await ARCHIVE.run(sync)
 
@@ -904,6 +959,8 @@ async def reconcile_all_categories_once() -> None:
     guild = get_configured_guild()
     if guild is None:
         return
+
+    await reconcile_channel_metadata(guild)
 
     for row in await watched_categories():
         try:
